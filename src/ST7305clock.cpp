@@ -47,20 +47,26 @@ extern "C" void SystemClock_Config(void) {
 
 // --- NEW BUTTON DEFINES ---
 #define BTN_LEFT PA3
-#define BTN_UP PB1
+#define BTN_UP PA6
 #define BTN_DOWN PB3
 #define BTN_RIGHT PB4
 
 #define SERIAL_BAUD     115200
 
 // --- NEW APP STATE VARIABLES ---
-enum AppState { STATE_MAIN, STATE_MENU, STATE_CHART };
+enum AppState { STATE_MAIN, STATE_MENU, STATE_CHART, STATE_SET_TIME };
 AppState currentState = STATE_MAIN;
 int8_t menuSelection = 0;
-const char* menuItems[6] = {"Temperature", "Rel Humidity", "Abs Humidity", "Pressure", "Voltage", "Current"};
+const char* menuItems[7] = {"Temperature", "Rel Humidity", "Abs Humidity", "Pressure", "Voltage", "Current", "Set Time"};
+const int8_t NUM_MENU_ITEMS = 7;
+
+// --- TIME SETTING VARIABLES ---
+bool editingMinutes = false;
+int8_t tempHour = 0;
+int8_t tempMinute = 0;
 
 // --- NEW DATA ARRAYS (400 points = ~9.6KB RAM) ---
-#define MAX_SAMPLES 200
+#define MAX_SAMPLES 400
 float histTemp[MAX_SAMPLES];
 float histRH[MAX_SAMPLES];
 float histAbsHum[MAX_SAMPLES];
@@ -172,13 +178,11 @@ void sendBufferDirect() {
 static uint8_t partialBuf[1500];
 bool forceMainRedraw = false;
 void sendPartialBuffer() {
-    // Adjusted bounding box perfectly aligned to the ST7305 12x2 grid.
-    // This perfectly envelops the new drawBox(226, 36, 90, 72).
-    uint8_t devXStart = 60, devXEnd = 120; // Safely covers U8g2 Y: 36 to 119
-    uint8_t devYStart = 68, devYEnd = 158; // Safely covers U8g2 X: 226 to 316
+    uint8_t devXStart = 60, devXEnd = 120;
+    uint8_t devYStart = 68, devYEnd = 158;
 
-    uint8_t casetStart = devXStart / 12; // Maps to hardware block 3
-    uint8_t casetEnd   = devXEnd   / 12; // Maps to hardware block 9
+    uint8_t casetStart = devXStart / 12;
+    uint8_t casetEnd   = devXEnd   / 12;
     uint8_t rasetStart = devYStart / 2;  
     uint8_t rasetEnd   = devYEnd   / 2;  
 
@@ -202,11 +206,9 @@ void sendPartialBuffer() {
     digitalWrite(PIN_LCD_DC, LOW);  SPI.transfer(0x2C);
     digitalWrite(PIN_LCD_DC, HIGH);
     
-    // Send only the exact number of bytes framed by the new window (~966 bytes)
     SPI.transfer(partialBuf, dst - partialBuf); 
     
     digitalWrite(PIN_LCD_CS, HIGH);
-
     SPI.endTransaction();
 }
 
@@ -216,11 +218,7 @@ void paintMainScreen(uint32_t now) {
     snprintf(secsBuf, sizeof(secsBuf), "%02u", seconds);
     uint32_t uptimeSecs = now - bootEpoch;
 
-
-
-
     if (seconds == 0 || uptimeSecs == 0 || forceMainRedraw) {
-        // --- Full Screen Refresh ---
         readAllSensors(now);
         forceMainRedraw = false;
         uint32_t uptimeDays  = uptimeSecs / 86400;
@@ -228,13 +226,11 @@ void paintMainScreen(uint32_t now) {
         uint32_t uptimeMins  = (uptimeSecs % 3600) / 60;
         uint32_t hours24 = (now % 86400) / 3600;
         uint32_t minutes = (now % 3600) / 60;
-
         
         uint8_t h12 = hours24 % 12;
         if (h12 == 0) h12 = 12;
         bool pm = hours24 >= 12;
 
-        // Dedicated buffers to handle split layout logic
         char timeMainBuf[12], tempBuf[16], humBuf[24], pressureBuf[16], voltBuf[16], curBuf[16], uptimeBuf[20];
         snprintf(timeMainBuf, sizeof(timeMainBuf), "%u:%02u:", h12, minutes);
 
@@ -252,14 +248,12 @@ void paintMainScreen(uint32_t now) {
         int v_int = (int)gBatteryVoltage;
         int v_frac = abs((int)(gBatteryVoltage * 1000.0f)) % 1000;
 
-        // Formatting raw strings
         snprintf(tempBuf, sizeof(tempBuf), "%s%d.%d\xc2\xb0" "C", t_sign, t_int, t_frac);
         snprintf(humBuf, sizeof(humBuf), "%d%% %d.%dg", h_int, ah_int, ah_frac);
         snprintf(pressureBuf, sizeof(pressureBuf), "%d.%dmB", p_int, p_frac);
         snprintf(voltBuf, sizeof(voltBuf), "%d.%03dv", v_int, v_frac);
         snprintf(curBuf, sizeof(curBuf), "%luuA", (unsigned long)gBatteryCurrent_uA);
         
-        // Uptime (Removed the "Up>" prefix so it aligns cleanly with your image's hourglass icon)
         if (uptimeDays > 365) {
             uint32_t uptimeYears = uptimeDays / 365;
             uint32_t remDays = uptimeDays % 365;
@@ -269,59 +263,42 @@ void paintMainScreen(uint32_t now) {
             snprintf(uptimeBuf, sizeof(uptimeBuf), "%lud %luh %lum",
                     (unsigned long)uptimeDays, (unsigned long)uptimeHours, (unsigned long)uptimeMins);
         }
+        
         u8g2.clearBuffer();
         u8g2.setFontMode(1);
         u8g2.setBitmapMode(1);
         
-        // Draw primary layout
         drawRleBackground(0, 0, 384, 164, epd_bitmap_rle);
         
-        // Dynamic AM/PM masking - Draw a white box over the incorrect permanent text
-        u8g2.setDrawColor(0); // Assuming 0 is the white background color in your display logic
+        u8g2.setDrawColor(0); 
         if (pm) {
-            u8g2.drawBox(320, 42, 50, 32); // Cover AM Text
+            u8g2.drawBox(320, 42, 50, 32); 
         } else {
-            u8g2.drawBox(320, 74, 50, 31); // Cover PM Text
+            u8g2.drawBox(320, 74, 50, 31); 
         }
 
-        // Return to standard text drawing color
         u8g2.setDrawColor(1); 
-        
-        // --- Large Clock Font ---
         u8g2.setFont(u8g2_font_logisoso62_tn);
         
-        // Hours/Minutes/Colons: Right-justified flush with X=223
         int timeWidth = u8g2.getStrWidth(timeMainBuf);
-        u8g2.drawStr(223 - timeWidth, 102, timeMainBuf);
-        
-        // Seconds
+        u8g2.drawStr(234 - timeWidth, 102, timeMainBuf);
         u8g2.drawStr(236, 102, secsBuf); 
         
-        // --- Small Details Font ---
         u8g2.setFont(u8g2_font_logisoso16_tr);
-        
-        // Top Banner Sensors
         u8g2.drawStr(48, 26, tempBuf);
         u8g2.drawStr(146, 26, humBuf);
         
-        // Pressure: Right-justified flush with X=371
         int pressWidth = u8g2.getStrWidth(pressureBuf);
         u8g2.drawStr(371 - pressWidth, 26, pressureBuf);
         
-        // Bottom Banner System Info
         u8g2.drawStr(56, 162, voltBuf);
         u8g2.drawStr(169, 162, curBuf);
         u8g2.drawStr(280, 162, uptimeBuf);
         
         sendBufferDirect();
     } else {
-// --- Partial Screen Refresh (Seconds Only) ---
-        // Generous bounding box to wipe all variable-width/height characters
-        // Logical X covers 226 to 316. Logical Y covers 36 to 108.
         u8g2.setDrawColor(0); 
         u8g2.clearBuffer();
-        //u8g2.drawBox(226, 36, 90, 72); 
-        
         u8g2.setDrawColor(1);
         u8g2.setFont(u8g2_font_logisoso62_tn);
         u8g2.drawStr(236, 126, secsBuf);
@@ -331,24 +308,56 @@ void paintMainScreen(uint32_t now) {
     }
 }
 
-// --- NEW MENU DRAWING FUNCTION ---
+// --- UPDATED MENU DRAWING FUNCTION ---
 void drawMenu() {
     u8g2.clearBuffer();
     u8g2.setFontMode(1);
     u8g2.setBitmapMode(1);
     u8g2.setDrawColor(1);
     u8g2.setFont(u8g2_font_logisoso16_tr);
-    for(int i = 0; i < 6; i++) {
-        int y = 24 + i * 26;
+    
+    // Adjusted spacing to 22px so all 7 items fit properly on the 164px screen height
+    for(int i = 0; i < NUM_MENU_ITEMS; i++) {
+        int y = 22 + i * 22;
         u8g2.drawStr(40, y, menuItems[i]);
         if(i == menuSelection) {
-            u8g2.drawFrame(30, y - 20, 220, 26);
+            u8g2.drawFrame(30, y - 18, 220, 24);
         }
     }
     sendBufferDirect();
 }
 
-// --- NEW CHART DRAWING FUNCTION ---
+// --- NEW SET TIME DRAWING FUNCTION ---
+void drawSetTime() {
+    u8g2.clearBuffer();
+    u8g2.setFontMode(1);
+    u8g2.setBitmapMode(1);
+    u8g2.setDrawColor(1);
+    
+    // Header
+    u8g2.setFont(u8g2_font_logisoso16_tr);
+    u8g2.drawStr(100, 30, "Set System Time");
+    
+    // Time Output
+    char timeBuf[16];
+    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", tempHour, tempMinute);
+    
+    u8g2.setFont(u8g2_font_logisoso62_tn);
+    int timeWidth = u8g2.getStrWidth(timeBuf);
+    int xOffset = (384 - timeWidth) / 2; // Center it on the screen
+    u8g2.drawStr(xOffset, 110, timeBuf);
+    
+    // Draw underline indicator based on active selection (Hour vs Minute)
+    // Approximate coordinate logic for typical logisoso font spacing
+    if (!editingMinutes) {
+        u8g2.drawBox(xOffset, 120, 75, 5); // Under Hours
+    } else {
+        u8g2.drawBox(xOffset + 95, 120, 75, 5); // Under Minutes
+    }
+    
+    sendBufferDirect();
+}
+
 void drawChart(int chartIndex) {
     u8g2.clearBuffer();
     u8g2.setFontMode(1);
@@ -376,16 +385,14 @@ void drawChart(int chartIndex) {
         if(dataArr[i] < minV) minV = dataArr[i];
         if(dataArr[i] > maxV) maxV = dataArr[i];
     }
-    if(maxV - minV < 0.001f) { // Prevent division by zero
+    if(maxV - minV < 0.001f) { 
         maxV += 1.0f;
         minV -= 1.0f;
     }
 
-    // 2px thick axes
-    u8g2.drawBox(65, 10, 2, 132); // Y axis
-    u8g2.drawBox(65, 140, 305, 2); // X axis
+    u8g2.drawBox(65, 10, 2, 132); 
+    u8g2.drawBox(65, 140, 305, 2); 
 
-    // Labels
     char buf[16];
     snprintf(buf, sizeof(buf), "%.1f", maxV);
     u8g2.drawStr(0, 20, buf);
@@ -396,7 +403,6 @@ void drawChart(int chartIndex) {
     snprintf(buf, sizeof(buf), "Samples:%d", histCount);
     u8g2.drawStr(240, 162, buf);
 
-    // 1px thick data line
     int prevX = -1, prevY = -1;
     for(int i = 0; i < histCount; i++) {
         int idx = (histCount < MAX_SAMPLES) ? i : (histHead + i) % MAX_SAMPLES;
@@ -417,28 +423,24 @@ void drawChart(int chartIndex) {
 void alarmMatch(void* data) { wakeFlag = true; }
 
 void sleepPins() {
-    // Keep CS and RST HIGH to prevent display resets/triggers
     digitalWrite(PIN_LCD_CS,  HIGH);
     digitalWrite(PIN_LCD_RST, HIGH);
+    digitalWrite(PIN_LCD_DC,  LOW);
+    digitalWrite(PWR_SENSORS, LOW);
     
-    // Keep DC LOW
-    digitalWrite(PIN_LCD_DC, LOW);
-
-    // Drive SCLK and MOSI LOW to prevent shoot-through on the ST7305
     GPIO_InitTypeDef g = {0};
     g.Mode  = GPIO_MODE_OUTPUT_PP;
     g.Pull  = GPIO_NOPULL;
     g.Speed = GPIO_SPEED_FREQ_LOW;
-    
-    g.Pin   = GPIO_PIN_5 | GPIO_PIN_7; 
+    g.Pin   = GPIO_PIN_5 | GPIO_PIN_7;   
     HAL_GPIO_Init(GPIOA, &g);
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5 | GPIO_PIN_7, GPIO_PIN_RESET);
 
-    // I2C Pins to Analog (Safe since pull-ups are on the switched rail)
     g.Mode  = GPIO_MODE_ANALOG;
-    g.Pin   = GPIO_PIN_6 | GPIO_PIN_7;
+    g.Pin   = GPIO_PIN_6 | GPIO_PIN_7;   
     HAL_GPIO_Init(GPIOB, &g);
-    
+
+    __HAL_RCC_I2C1_CLK_DISABLE();        
 }
 
 void wakePins() {
@@ -449,17 +451,15 @@ void wakePins() {
     g.Speed     = GPIO_SPEED_FREQ_LOW;
     g.Alternate = GPIO_AF5_SPI1;
     HAL_GPIO_Init(GPIOA, &g);
-    
-    // I2C pin config removed to prevent mapping pins to a disabled peripheral clock
-}
 
-//HardwareSerial DebugSerial(PA10, PA9);
+    __HAL_RCC_I2C1_CLK_ENABLE();         
+}
 
 void readAllSensors(uint32_t &now) {
     digitalWrite(PWR_SENSORS, HIGH);
     delay(100);
-    Wire.setSCL(I2C1_SCL); // Re-map SCL
-    Wire.setSDA(I2C1_SDA); // Re-map SDA
+    Wire.setSCL(I2C1_SCL); 
+    Wire.setSDA(I2C1_SDA); 
     Wire.begin();
     Wire.setClock(100000);
     if (ds3231.begin(&Wire)) {
@@ -500,7 +500,7 @@ void readAllSensors(uint32_t &now) {
     gBatteryCurrent_uA = (uint32_t)(current_mA * 1000.0f + 0.5f);
     
     Wire.end();
-    delay(50); // Short delay to ensure all I2C transactions are fully completed before cutting power
+    delay(50); 
     digitalWrite(PWR_SENSORS, LOW);
 }
 
@@ -510,49 +510,33 @@ void buttonISR() {
     btnWakeFlag = true;
 }
 
-// Helper to poll button states cleanly
 bool isPressed(uint32_t pin) {
-    return digitalRead(pin) == LOW; // Assumes internal pull-ups pulling to GND when pressed
+    return digitalRead(pin) == LOW; 
 }
 
 void setup() {
-    //DebugSerial.begin(115200);
-    //DebugSerial.println("Setup start");
     Wire.setSCL(I2C1_SCL);
     Wire.setSDA(I2C1_SDA);
 
-// --- FIX FLOATING PINS (Prevents 200uA -> 400uA leak) ---
-    pinMode(PA10, INPUT_ANALOG); // UART RX (Floating when unplugged)
-    pinMode(PA9,  INPUT_ANALOG); // UART TX 
-    pinMode(PA6,  INPUT_ANALOG); // MISO (Unused)
-    // --- REMAINING UNUSED PINS -> ANALOG ---
+    pinMode(PA10, INPUT_ANALOG); 
+    pinMode(PA9,  INPUT_ANALOG);  
+    pinMode(PA6,  INPUT_ANALOG); 
     pinMode(PA8,  INPUT_ANALOG);
     pinMode(PA11, INPUT_ANALOG);
     pinMode(PA12, INPUT_ANALOG);
     pinMode(PB5,  INPUT_ANALOG);
 
-    // 1. Enable the GPIOA clock (it must be on to configure the pins)
     RCC->AHB2ENR |= RCC_AHB2ENR_GPIOAEN;
-    
-    // 2. Set the MODER bits for PA13 (bits 26,27) and PA14 (bits 28,29) to 0b11 (Analog Mode)
-    // 0b11 is the bit pattern for Analog mode on STM32
     GPIOA->MODER |= (GPIO_MODER_MODE13 | GPIO_MODER_MODE14);
-    pinMode(PA_15, INPUT_ANALOG); // JTDI
+    pinMode(PA_15, INPUT_ANALOG); 
 
-    // --- LSE OSCILLATOR PINS ---
-    // Since you are using the internal MSI clock and an external DS3231 RTC, 
-    // you likely do not have a 32.768kHz crystal physically soldered to these pins.
-    // If they are bare pads, set them to analog to prevent floating inputs.
     pinMode(PC14, INPUT_ANALOG); 
     pinMode(PC15, INPUT_ANALOG);
-    // --- SETUP BUTTON INPUTS ---
-    // Changed to INPUT since you have external pullups (saves wasting parallel resistance)
+
     pinMode(BTN_LEFT, INPUT);
     pinMode(BTN_UP, INPUT);
     pinMode(BTN_DOWN, INPUT);
     pinMode(BTN_RIGHT, INPUT);
-
-
 
     pinMode(PWR_SENSORS, OUTPUT); digitalWrite(PWR_SENSORS, LOW);
     stmRtc.begin(); 
@@ -563,7 +547,7 @@ void setup() {
     Wire.setClock(100000);
     if (ds3231.begin(&Wire)) {
         if (ds3231.lostPower()) {
-            ds3231.adjust(DateTime(F(__DATE__), F(__TIME__)) + TimeSpan(23)); //add 23 seconds to compensate for compile time to upload time delay
+            ds3231.adjust(DateTime(F(__DATE__), F(__TIME__)) + TimeSpan(22)); 
         }
         uint32_t dsEpoch = ds3231.now().unixtime();
         stmRtc.setEpoch(dsEpoch);
@@ -601,7 +585,7 @@ void setup() {
     gBatteryCurrent_uA = (uint32_t)(current_mA * 1000.0f + 0.5f);
     
     Wire.end();
-    delay(50); // Short delay to ensure all I2C transactions are fully completed before cutting power
+    delay(50); 
     digitalWrite(PWR_SENSORS, LOW);
 
     bootEpoch = stmRtc.getEpoch();
@@ -630,116 +614,22 @@ void setup() {
 
     u8g2.sendF("c", 0x39);
     u8g2.sendF("ca", 0xB2, 0x00);
-    uint32_t seconds = bootEpoch % 60;
-    char secsBuf[4];
-    snprintf(secsBuf, sizeof(secsBuf), "%02u", seconds);
-    uint32_t uptimeSecs = 0;
-        uint32_t uptimeDays  = uptimeSecs / 86400;
-        uint32_t uptimeHours = (uptimeSecs % 86400) / 3600;
-        uint32_t uptimeMins  = (uptimeSecs % 3600) / 60;
-        uint32_t hours24 = (bootEpoch % 86400) / 3600;
-        uint32_t minutes = (bootEpoch % 3600) / 60;
-
-        
-        uint8_t h12 = hours24 % 12;
-        if (h12 == 0) h12 = 12;
-        bool pm = hours24 >= 12;
-
-        // Dedicated buffers to handle split layout logic
-        char timeMainBuf[12], tempBuf[16], humBuf[24], pressureBuf[16], voltBuf[16], curBuf[16], uptimeBuf[20];
-        snprintf(timeMainBuf, sizeof(timeMainBuf), "%u:%02u:", h12, minutes);
-
-        int t_int = (int)gTemperature;
-        int t_frac = abs((int)(gTemperature * 10.0f)) % 10;
-        const char* t_sign = (gTemperature < 0.0f && t_int == 0) ? "-" : "";
-
-        int h_int = (int)(gHumidity + 0.5f);
-        int ah_int = (int)gAbsHumidity;
-        int ah_frac = abs((int)(gAbsHumidity * 10.0f)) % 10;
-
-        int p_int = (int)gPressure;
-        int p_frac = abs((int)(gPressure * 10.0f)) % 10;
-
-        int v_int = (int)gBatteryVoltage;
-        int v_frac = abs((int)(gBatteryVoltage * 1000.0f)) % 1000;
-
-        // Formatting raw strings
-        snprintf(tempBuf, sizeof(tempBuf), "%s%d.%d\xc2\xb0" "C", t_sign, t_int, t_frac);
-        snprintf(humBuf, sizeof(humBuf), "%d%% %d.%dg", h_int, ah_int, ah_frac);
-        snprintf(pressureBuf, sizeof(pressureBuf), "%d.%dmB", p_int, p_frac);
-        snprintf(voltBuf, sizeof(voltBuf), "%d.%03dv", v_int, v_frac);
-        snprintf(curBuf, sizeof(curBuf), "%luuA", (unsigned long)gBatteryCurrent_uA);
-        
-        // Uptime (Removed the "Up>" prefix so it aligns cleanly with your image's hourglass icon)
-        if (uptimeDays > 365) {
-            uint32_t uptimeYears = uptimeDays / 365;
-            uint32_t remDays = uptimeDays % 365;
-            snprintf(uptimeBuf, sizeof(uptimeBuf), "%luy %lud %luh",
-                    (unsigned long)uptimeYears, (unsigned long)remDays, (unsigned long)uptimeHours);
-        } else {
-            snprintf(uptimeBuf, sizeof(uptimeBuf), "%lud %luh %lum",
-                    (unsigned long)uptimeDays, (unsigned long)uptimeHours, (unsigned long)uptimeMins);
-        }
-        u8g2.clearBuffer();
-        u8g2.setFontMode(1);
-        u8g2.setBitmapMode(1);
-        
-        // Draw primary layout
-        drawRleBackground(0, 0, 384, 164, epd_bitmap_rle);
-        
-        // Dynamic AM/PM masking - Draw a white box over the incorrect permanent text
-        u8g2.setDrawColor(0); // Assuming 0 is the white background color in your display logic
-        if (pm) {
-            u8g2.drawBox(320, 42, 50, 32); // Cover AM Text
-        } else {
-            u8g2.drawBox(320, 74, 50, 31); // Cover PM Text
-        }
-
-        // Return to standard text drawing color
-        u8g2.setDrawColor(1); 
-        
-        // --- Large Clock Font ---
-        u8g2.setFont(u8g2_font_logisoso62_tn);
-        
-        // Hours/Minutes/Colons: Right-justified flush with X=223
-        int timeWidth = u8g2.getStrWidth(timeMainBuf);
-        u8g2.drawStr(223 - timeWidth, 102, timeMainBuf);
-        
-        // Seconds
-        u8g2.drawStr(236, 102, secsBuf); 
-        
-        // --- Small Details Font ---
-        u8g2.setFont(u8g2_font_logisoso16_tr);
-        
-        // Top Banner Sensors
-        u8g2.drawStr(48, 26, tempBuf);
-        u8g2.drawStr(146, 26, humBuf);
-        
-        // Pressure: Right-justified flush with X=371
-        int pressWidth = u8g2.getStrWidth(pressureBuf);
-        u8g2.drawStr(371 - pressWidth, 26, pressureBuf);
-        
-        // Bottom Banner System Info
-        u8g2.drawStr(56, 162, voltBuf);
-        u8g2.drawStr(169, 162, curBuf);
-        u8g2.drawStr(280, 162, uptimeBuf);
-        
-        sendBufferDirect();
+    
+    forceMainRedraw = true;
+    paintMainScreen(stmRtc.getEpoch());
+    
     sleepPins();
     HAL_DBGMCU_DisableDBGStopMode();
     LowPower.begin();
     stmRtc.attachInterrupt(alarmMatch); 
-
 }
 
 void loop() {
-   // wakePins();
     uint32_t now = stmRtc.getEpoch();
     
     static uint32_t lastDisplayTick = 0;
     static uint32_t lastInteractionTime = 0;
     
-    // State trackers for edge detection
     static bool lastUp = false;
     static bool lastDown = false;
     static bool lastLeft = false;
@@ -752,8 +642,23 @@ void loop() {
         lastDisplayTick = now;
         
         if (now - lastSensorRead >= 60) {
-            //readAllSensors(now);
             lastSensorRead = now;
+
+            // Push the current global readings into the circular buffer
+            histTemp[histHead]   = gTemperature;
+            histRH[histHead]     = gHumidity;
+            histAbsHum[histHead] = gAbsHumidity;
+            histPress[histHead]  = gPressure;
+            histVolt[histHead]   = gBatteryVoltage;
+            histCur[histHead]    = (float)gBatteryCurrent_uA;
+
+            // Advance the head index and wrap around if necessary
+            histHead = (histHead + 1) % MAX_SAMPLES;
+            
+            // Increment the total sample count until it fills the buffer
+            if (histCount < MAX_SAMPLES) {
+                histCount++;
+            }
         }
 
         if (currentState == STATE_MAIN) {
@@ -791,22 +696,84 @@ void loop() {
             lastInteractionTime = millis(); 
             
             if (pressUp) {
-                menuSelection = (menuSelection == 0) ? 5 : menuSelection - 1;
+                menuSelection = (menuSelection == 0) ? NUM_MENU_ITEMS - 1 : menuSelection - 1;
                 drawMenu();
             } else if (pressDown) {
-                menuSelection = (menuSelection == 5) ? 0 : menuSelection + 1;
+                menuSelection = (menuSelection == NUM_MENU_ITEMS - 1) ? 0 : menuSelection + 1;
                 drawMenu();
             } else if (pressLeft) {
                 currentState = STATE_MAIN;
-                forceMainRedraw = true;  // <-- Force a complete screen wipe
+                forceMainRedraw = true;  
                 paintMainScreen(now);
                 lastDisplayTick = now;
             } else if (pressRight) {
-                currentState = STATE_CHART;
-                drawChart(menuSelection);
+                if (menuSelection == 6) { // "Set Time" Sub-menu
+                    currentState = STATE_SET_TIME;
+                    editingMinutes = false;
+                    tempHour = (now % 86400) / 3600;
+                    tempMinute = (now % 3600) / 60;
+                    drawSetTime();
+                } else {
+                    currentState = STATE_CHART;
+                    drawChart(menuSelection);
+                }
             }
         }
     } 
+    // --- TIME SETTING STATE CONTROLS ---
+    else if (currentState == STATE_SET_TIME) {
+        if (pressUp || pressDown || pressLeft || pressRight) {
+            lastInteractionTime = millis();
+            
+            if (pressLeft) { // Cancel and go back
+                currentState = STATE_MENU;
+                drawMenu();
+            } else if (pressRight) {
+                if (!editingMinutes) {
+                    editingMinutes = true; // Switch context to editing minutes
+                    drawSetTime();
+                } else {
+                    // Right arrow again: Save time and return to Main
+                    digitalWrite(PWR_SENSORS, HIGH);
+                    delay(100);
+                    Wire.setSCL(I2C1_SCL); 
+                    Wire.setSDA(I2C1_SDA); 
+                    Wire.begin();
+                    Wire.setClock(100000);
+                    
+                    if (ds3231.begin(&Wire)) {
+                        DateTime dt = ds3231.now();
+                        DateTime newTime(dt.year(), dt.month(), dt.day(), tempHour, tempMinute, 0);
+                        ds3231.adjust(newTime);
+                        stmRtc.setEpoch(newTime.unixtime());
+                    }
+                    
+                    Wire.end();
+                    digitalWrite(PWR_SENSORS, LOW);
+                    
+                    currentState = STATE_MAIN;
+                    forceMainRedraw = true;  
+                    now = stmRtc.getEpoch(); // Get immediately updated time
+                    paintMainScreen(now);
+                    lastDisplayTick = now;
+                }
+            } else if (pressUp) {
+                if (!editingMinutes) {
+                    tempHour = (tempHour == 23) ? 0 : tempHour + 1;
+                } else {
+                    tempMinute = (tempMinute == 59) ? 0 : tempMinute + 1;
+                }
+                drawSetTime();
+            } else if (pressDown) {
+                if (!editingMinutes) {
+                    tempHour = (tempHour == 0) ? 23 : tempHour - 1;
+                } else {
+                    tempMinute = (tempMinute == 0) ? 59 : tempMinute - 1;
+                }
+                drawSetTime();
+            }
+        }
+    }
     else if (currentState == STATE_CHART) {
         if (pressLeft) {
             lastInteractionTime = millis();
@@ -814,7 +781,7 @@ void loop() {
             drawMenu();
         } else if (pressUp || pressDown || pressRight) {
             currentState = STATE_MAIN;
-            forceMainRedraw = true;  // <-- Force a complete screen wipe
+            forceMainRedraw = true;  
             paintMainScreen(now);
             lastDisplayTick = now;
         }
@@ -823,16 +790,15 @@ void loop() {
     // --- 4. Auto-Exit Menu (Battery Protection) ---
     if (currentState != STATE_MAIN && (millis() - lastInteractionTime > 15000)) {
         currentState = STATE_MAIN;
-        forceMainRedraw = true;      // <-- Force a complete screen wipe
+        forceMainRedraw = true;      
         paintMainScreen(now);
         lastDisplayTick = now;
     }
 
     // --- 5. Power Management ---
-// --- 5. Power Management ---
     if (currentState == STATE_MAIN) {
-        SPI.end(); // Unhook the SPI peripheral 
-        sleepPins(); // Clamp the pins manually
+        SPI.end(); 
+        sleepPins(); 
         
         uint32_t targetAlarm = stmRtc.getEpoch() + 1;
         stmRtc.setAlarmEpoch(targetAlarm);
@@ -844,8 +810,8 @@ void loop() {
         
         LowPower.deepSleep(); 
         
-        wakePins(); // Reassign pins to Alternate Function
-        SPI.begin(); // Reinitialize SPI block
+        wakePins(); 
+        SPI.begin(); 
     } else {
         delay(50); 
     }
