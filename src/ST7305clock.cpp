@@ -45,7 +45,6 @@ extern "C" void SystemClock_Config(void) {
 #define PIN_LCD_TE      PA1
 #define PIN_LCD_RST     PA2 
 
-// --- NEW BUTTON DEFINES ---
 #define BTN_LEFT PA3
 #define BTN_UP PA6
 #define BTN_DOWN PB3
@@ -53,19 +52,16 @@ extern "C" void SystemClock_Config(void) {
 
 #define SERIAL_BAUD     115200
 
-// --- NEW APP STATE VARIABLES ---
 enum AppState { STATE_MAIN, STATE_MENU, STATE_CHART, STATE_SET_TIME };
 AppState currentState = STATE_MAIN;
 int8_t menuSelection = 0;
 const char* menuItems[7] = {"Temperature", "Rel Humidity", "Abs Humidity", "Pressure", "Voltage", "Current", "Set Time"};
 const int8_t NUM_MENU_ITEMS = 7;
 
-// --- TIME SETTING VARIABLES ---
 bool editingMinutes = false;
 int8_t tempHour = 0;
 int8_t tempMinute = 0;
 
-// --- NEW DATA ARRAYS (400 points = ~9.6KB RAM) ---
 #define MAX_SAMPLES 400
 float histTemp[MAX_SAMPLES];
 float histRH[MAX_SAMPLES];
@@ -73,8 +69,15 @@ float histAbsHum[MAX_SAMPLES];
 float histPress[MAX_SAMPLES];
 float histVolt[MAX_SAMPLES];
 float histCur[MAX_SAMPLES];
+
 uint16_t histHead = 0;
 uint16_t histCount = 0;
+
+uint16_t voltHead = 0;
+uint16_t voltCount = 0;
+uint8_t voltSampleCounter = 0;
+
+int chartCursor = -1;
 
 void readAllSensors(uint32_t &now);
 U8G2_ST7305_168X384_F_4W_HW_SPI u8g2(U8G2_R3, PIN_LCD_CS, PIN_LCD_DC, PIN_LCD_RST);
@@ -158,17 +161,42 @@ void convertBuffer() {
     }
 }
 
+void setLcdWindow(uint8_t casetStart, uint8_t casetEnd, uint8_t rasetStart, uint8_t rasetEnd) {
+    digitalWrite(PIN_LCD_DC, LOW);  SPI.transfer(0x2A);
+    digitalWrite(PIN_LCD_DC, HIGH); SPI.transfer(casetStart); SPI.transfer(casetEnd);
+    digitalWrite(PIN_LCD_DC, LOW);  SPI.transfer(0x2B);
+    digitalWrite(PIN_LCD_DC, HIGH); SPI.transfer(rasetStart); SPI.transfer(rasetEnd);
+    digitalWrite(PIN_LCD_DC, LOW);  SPI.transfer(0x2C);
+    digitalWrite(PIN_LCD_DC, HIGH);
+}
+
+void prepDisplay() {
+    u8g2.clearBuffer();
+    u8g2.setFontMode(1);
+    u8g2.setBitmapMode(1);
+    u8g2.setDrawColor(1);
+}
+
+void powerSensors(bool state) {
+    if (state) {
+        digitalWrite(PWR_SENSORS, HIGH);
+        delay(100);
+        Wire.setSCL(I2C1_SCL); 
+        Wire.setSDA(I2C1_SDA); 
+        Wire.begin();
+        Wire.setClock(100000);
+    } else {
+        Wire.end();
+        digitalWrite(PWR_SENSORS, LOW);
+    }
+}
+
 void sendBufferDirect() {
     convertBuffer();
     SPI.beginTransaction(SPISettings(12000000, MSBFIRST, SPI_MODE0));
     
     digitalWrite(PIN_LCD_CS, LOW);
-    digitalWrite(PIN_LCD_DC, LOW);  SPI.transfer(0x2A);
-    digitalWrite(PIN_LCD_DC, HIGH); SPI.transfer(0x17); SPI.transfer(0x24);
-    digitalWrite(PIN_LCD_DC, LOW);  SPI.transfer(0x2B);
-    digitalWrite(PIN_LCD_DC, HIGH); SPI.transfer(0x00); SPI.transfer(0xBF);
-    digitalWrite(PIN_LCD_DC, LOW);  SPI.transfer(0x2C);
-    digitalWrite(PIN_LCD_DC, HIGH);
+    setLcdWindow(0x17, 0x24, 0x00, 0xBF);
     SPI.transfer(convertedBuf, sizeof(convertedBuf));
     digitalWrite(PIN_LCD_CS, HIGH);
     
@@ -179,7 +207,7 @@ static uint8_t partialBuf[1500];
 bool forceMainRedraw = false;
 void sendPartialBuffer() {
     uint8_t devXStart = 60, devXEnd = 120;
-    uint8_t devYStart = 68, devYEnd = 158;
+    uint8_t devYStart = 68, devYEnd = 150;
 
     uint8_t casetStart = devXStart / 12;
     uint8_t casetEnd   = devXEnd   / 12;
@@ -196,19 +224,13 @@ void sendPartialBuffer() {
         }
     }
 
-    SPI.beginTransaction(SPISettings(12000000, MSBFIRST, SPI_MODE0));
+SPI.beginTransaction(SPISettings(12000000, MSBFIRST, SPI_MODE0));
 
     digitalWrite(PIN_LCD_CS, LOW);
-    digitalWrite(PIN_LCD_DC, LOW);  SPI.transfer(0x2A);
-    digitalWrite(PIN_LCD_DC, HIGH); SPI.transfer(0x17 + casetStart); SPI.transfer(0x17 + casetEnd);
-    digitalWrite(PIN_LCD_DC, LOW);  SPI.transfer(0x2B);
-    digitalWrite(PIN_LCD_DC, HIGH); SPI.transfer(rasetStart); SPI.transfer(rasetEnd);
-    digitalWrite(PIN_LCD_DC, LOW);  SPI.transfer(0x2C);
-    digitalWrite(PIN_LCD_DC, HIGH);
-    
+    setLcdWindow(0x17 + casetStart, 0x17 + casetEnd, rasetStart, rasetEnd);
     SPI.transfer(partialBuf, dst - partialBuf); 
-    
     digitalWrite(PIN_LCD_CS, HIGH);
+    
     SPI.endTransaction();
 }
 
@@ -284,7 +306,7 @@ void paintMainScreen(uint32_t now) {
         u8g2.drawStr(234 - timeWidth, 102, timeMainBuf);
         u8g2.drawStr(236, 102, secsBuf); 
         
-        u8g2.setFont(u8g2_font_logisoso16_tr);
+        u8g2.setFont(u8g2_font_profont17_tr);
         u8g2.drawStr(48, 26, tempBuf);
         u8g2.drawStr(146, 26, humBuf);
         
@@ -308,15 +330,10 @@ void paintMainScreen(uint32_t now) {
     }
 }
 
-// --- UPDATED MENU DRAWING FUNCTION ---
 void drawMenu() {
-    u8g2.clearBuffer();
-    u8g2.setFontMode(1);
-    u8g2.setBitmapMode(1);
-    u8g2.setDrawColor(1);
-    u8g2.setFont(u8g2_font_logisoso16_tr);
+    prepDisplay();
+    u8g2.setFont(u8g2_font_profont17_tr);
     
-    // Adjusted spacing to 22px so all 7 items fit properly on the 164px screen height
     for(int i = 0; i < NUM_MENU_ITEMS; i++) {
         int y = 22 + i * 22;
         u8g2.drawStr(40, y, menuItems[i]);
@@ -327,96 +344,209 @@ void drawMenu() {
     sendBufferDirect();
 }
 
-// --- NEW SET TIME DRAWING FUNCTION ---
 void drawSetTime() {
-    u8g2.clearBuffer();
-    u8g2.setFontMode(1);
-    u8g2.setBitmapMode(1);
-    u8g2.setDrawColor(1);
+    prepDisplay();
     
-    // Header
-    u8g2.setFont(u8g2_font_logisoso16_tr);
+
+    u8g2.setFont(u8g2_font_profont17_tr);
     u8g2.drawStr(100, 30, "Set System Time");
     
-    // Time Output
     char timeBuf[16];
     snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", tempHour, tempMinute);
     
     u8g2.setFont(u8g2_font_logisoso62_tn);
     int timeWidth = u8g2.getStrWidth(timeBuf);
-    int xOffset = (384 - timeWidth) / 2; // Center it on the screen
+    int xOffset = (384 - timeWidth) / 2; 
     u8g2.drawStr(xOffset, 110, timeBuf);
     
-    // Draw underline indicator based on active selection (Hour vs Minute)
-    // Approximate coordinate logic for typical logisoso font spacing
     if (!editingMinutes) {
-        u8g2.drawBox(xOffset, 120, 75, 5); // Under Hours
+        u8g2.drawBox(xOffset, 120, 75, 5); 
     } else {
-        u8g2.drawBox(xOffset + 95, 120, 75, 5); // Under Minutes
+        u8g2.drawBox(xOffset + 95, 120, 75, 5); 
     }
     
     sendBufferDirect();
 }
 
 void drawChart(int chartIndex) {
-    u8g2.clearBuffer();
-    u8g2.setFontMode(1);
-    u8g2.setBitmapMode(1);
-    u8g2.setDrawColor(1);
-    u8g2.setFont(u8g2_font_logisoso16_tr);
+    prepDisplay();
 
-    float minV = 999999.0f;
-    float maxV = -999999.0f;
     float* dataArr = histTemp;
+    uint16_t cCount = histCount;
+    uint16_t cHead = histHead;
     
     if(chartIndex == 1) dataArr = histRH;
     else if(chartIndex == 2) dataArr = histAbsHum;
     else if(chartIndex == 3) dataArr = histPress;
-    else if(chartIndex == 4) dataArr = histVolt;
+    else if(chartIndex == 4) {
+        dataArr = histVolt;
+        cCount = voltCount;
+        cHead = voltHead;
+    }
     else if(chartIndex == 5) dataArr = histCur;
 
-    if (histCount == 0) {
-        u8g2.drawStr(100, 80, "No Data Yet");
+    if (cCount == 0) {
         sendBufferDirect();
         return;
     }
 
-    for(int i = 0; i < histCount; i++) {
-        if(dataArr[i] < minV) minV = dataArr[i];
-        if(dataArr[i] > maxV) maxV = dataArr[i];
+    float minV = 99999.0f;
+    float maxV = -99999.0f;
+
+    for(int i = 0; i < cCount; i++) {
+        int idx = (cCount < MAX_SAMPLES) ? i : (cHead + i) % MAX_SAMPLES;
+        if(dataArr[idx] < minV) minV = dataArr[idx];
+        if(dataArr[idx] > maxV) maxV = dataArr[idx];
     }
     if(maxV - minV < 0.001f) { 
         maxV += 1.0f;
         minV -= 1.0f;
     }
 
-    u8g2.drawBox(65, 10, 2, 132); 
-    u8g2.drawBox(65, 140, 305, 2); 
+    u8g2.setFont(u8g2_font_profont17_tr);
+    int titleW = u8g2.getStrWidth(menuItems[chartIndex]);
+    u8g2.drawStr((384 - titleW) / 2, 20, menuItems[chartIndex]);
 
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%.1f", maxV);
-    u8g2.drawStr(0, 20, buf);
-    snprintf(buf, sizeof(buf), "%.1f", minV);
-    u8g2.drawStr(0, 140, buf);
+    // Increased xStart to 36 so Y-axis labels (like 1013.2) don't get clipped on the left
+    int xStart = 36; 
+    int xEnd = 370;
+    int yTop = 30;
+    int yBottom = 146;
+
+    // --- Draw Axes ---
+    u8g2.drawBox(xStart, yTop, 2, yBottom - yTop + 2); 
+    u8g2.drawBox(xStart, yBottom, xEnd - xStart, 2);   
+
+    u8g2.setFont(u8g2_font_4x6_tr);
+    char buf[32];
     
-    u8g2.drawStr(100, 162, menuItems[chartIndex]);
-    snprintf(buf, sizeof(buf), "Samples:%d", histCount);
-    u8g2.drawStr(240, 162, buf);
+    // --- Y-Axis Labels & Ticks ---
+    int yMid = yTop + (yBottom - yTop) / 2;
+    float midV = (maxV + minV) / 2.0f;
+    
+    // Helper to safely format floats to 1 decimal place without %f
+    auto fmtFloat1 = [&](float v) {
+        int i = (int)v;
+        int f = abs((int)(v * 10.0f)) % 10;
+        const char* sign = (v < 0 && i == 0) ? "-" : "";
+        snprintf(buf, sizeof(buf), "%s%d.%d", sign, i, f);
+    };
+
+    // Y-Axis Ticks
+    u8g2.drawLine(xStart - 4, yTop, xStart, yTop);
+    u8g2.drawLine(xStart - 4, yMid, xStart, yMid);
+    u8g2.drawLine(xStart - 4, yBottom, xStart, yBottom);
+
+    // Y-Axis Labels (Right-aligned to the tick marks)
+    fmtFloat1(maxV);
+    int tw = u8g2.getStrWidth(buf);
+    u8g2.drawStr(xStart - 6 - tw, yTop + 3, buf);
+    
+    fmtFloat1(midV);
+    tw = u8g2.getStrWidth(buf);
+    u8g2.drawStr(xStart - 6 - tw, yMid + 3, buf);
+
+    fmtFloat1(minV);
+    tw = u8g2.getStrWidth(buf);
+    u8g2.drawStr(xStart - 6 - tw, yBottom, buf);
+
+    // --- X-Axis Labels & Ticks ---
+    // Start Tick (0)
+    u8g2.drawLine(xStart, yBottom, xStart, yBottom + 4);
+    u8g2.drawStr(xStart - 2, yBottom + 12, "0");
+    
+    // End Tick (cCount)
+    u8g2.drawLine(xEnd, yBottom, xEnd, yBottom + 4);
+    snprintf(buf, sizeof(buf), "%d", cCount);
+    int endW = u8g2.getStrWidth(buf);
+    u8g2.drawStr(xEnd - endW/2, yBottom + 12, buf);
+
+    // Intermediate X-Ticks (25%, 50%, 75%)
+    for (int i = 1; i <= 3; i++) {
+        int tickX = xStart + i * (xEnd - xStart) / 4;
+        int tickVal = i * cCount / 4;
+        u8g2.drawLine(tickX, yBottom, tickX, yBottom + 4); 
+        
+        snprintf(buf, sizeof(buf), "%d", tickVal);
+        int twX = u8g2.getStrWidth(buf);
+        u8g2.drawStr(tickX - twX / 2, yBottom + 12, buf);   
+    }
 
     int prevX = -1, prevY = -1;
-    for(int i = 0; i < histCount; i++) {
-        int idx = (histCount < MAX_SAMPLES) ? i : (histHead + i) % MAX_SAMPLES;
+    int cursorX = -1, cursorY = -1;
+    float cursorVal = 0;
+
+    if (chartCursor >= cCount) chartCursor = cCount - 1;
+    if (chartCursor < 0 && cCount > 0) chartCursor = cCount - 1;
+
+    for(int i = 0; i < cCount; i++) {
+        int idx = (cCount < MAX_SAMPLES) ? i : (cHead + i) % MAX_SAMPLES;
         float val = dataArr[idx];
         
-        int x = 69 + (i * 297) / (histCount > 1 ? histCount - 1 : 1);
-        int y = 138 - ((val - minV) * 126 / (maxV - minV));
+        int x = xStart + 2 + (i * (xEnd - xStart - 4)) / (cCount > 1 ? cCount - 1 : 1);
+        int y = yBottom - 2 - ((val - minV) * (yBottom - yTop - 4) / (maxV - minV));
         
         if(prevX != -1) {
             u8g2.drawLine(prevX, prevY, x, y);
         }
         prevX = x;
         prevY = y;
+
+        if (i == chartCursor) {
+            cursorX = x;
+            cursorY = y;
+            cursorVal = val;
+        }
     }
+
+    // --- Cursor Drawing & Labeling ---
+    if (cursorX != -1) {
+        // Vertical dotted crosshair line
+        for(int cy = yTop; cy < yBottom; cy += 4) {
+            u8g2.drawPixel(cursorX, cy); 
+        }
+        // Horizontal dotted crosshair line
+        for(int cx = xStart; cx < xEnd; cx += 4) {
+            u8g2.drawPixel(cx, cursorY); 
+        }
+        
+        u8g2.drawCircle(cursorX, cursorY, 4);
+        
+        u8g2.setFont(u8g2_font_profont17_tr);
+        
+        // --- Real Time Timestamp Calculation ---
+        int timeAgo = (cCount - 1) - chartCursor;
+        uint32_t now = stmRtc.getEpoch();
+        uint32_t pointTime = 0;
+        
+        // chartIndex 4 (Voltage) runs on an hourly tick, others on a minute tick
+        if (chartIndex == 4) {
+            pointTime = now - (timeAgo * 3600);
+        } else {
+            pointTime = now - (timeAgo * 60);
+        }
+        
+        uint32_t h24 = (pointTime % 86400) / 3600;
+        uint32_t m = (pointTime % 3600) / 60;
+        
+        // Format cursor value manually (2 decimal places) avoiding %f
+        int val_i = (int)cursorVal;
+        int val_f = abs((int)(cursorVal * 100.0f)) % 100;
+        const char* sign = (cursorVal < 0 && val_i == 0) ? "-" : "";
+        
+        // Output format: e.g., "24.53 @ 14:27"
+        snprintf(buf, sizeof(buf), "%s%d.%02d @ %02lu:%02lu", sign, val_i, val_f, (unsigned long)h24, (unsigned long)m);
+        
+        int valW = u8g2.getStrWidth(buf);
+        
+        // Ensure text stays on opposite side of cursor to prevent overlapping the line
+        if (cursorX < 192) {
+            u8g2.drawStr(370 - valW, 20, buf); 
+        } else {
+            u8g2.drawStr(xStart, 20, buf);
+        }
+    }
+
     sendBufferDirect();
 }
 
@@ -456,19 +586,14 @@ void wakePins() {
 }
 
 void readAllSensors(uint32_t &now) {
-    digitalWrite(PWR_SENSORS, HIGH);
-    delay(100);
-    Wire.setSCL(I2C1_SCL); 
-    Wire.setSDA(I2C1_SDA); 
-    Wire.begin();
-    Wire.setClock(100000);
+powerSensors(true);
     if (ds3231.begin(&Wire)) {
         DateTime dt = ds3231.now();
         stmRtc.setEpoch(dt.unixtime());
         now = dt.unixtime();
     }
 
-    if(!ina219.init()){ Serial.println("INA219 not connected!"); }
+    if(!ina219.init()){ }
     ina219.setShuntSizeInOhms(1.0);
     ina219.setBusRange(INA219_BRNG_16);
     ina219.setPGain(INA219_PG_40);
@@ -496,12 +621,11 @@ void readAllSensors(uint32_t &now) {
     
     gBatteryVoltage = ina219.getBusVoltage_V();
     float current_mA = ina219.getCurrent_mA();
-    if (current_mA < 0.0f) current_mA = 0.0f;
+   // if (current_mA < 0.0f) current_mA = 0.0f;
     gBatteryCurrent_uA = (uint32_t)(current_mA * 1000.0f + 0.5f);
     
-    Wire.end();
-    delay(50); 
-    digitalWrite(PWR_SENSORS, LOW);
+powerSensors(false);
+
 }
 
 volatile bool btnWakeFlag = false;
@@ -541,55 +665,22 @@ void setup() {
     pinMode(PWR_SENSORS, OUTPUT); digitalWrite(PWR_SENSORS, LOW);
     stmRtc.begin(); 
 
-    digitalWrite(PWR_SENSORS, HIGH);
-    delay(10); 
-    Wire.begin();
-    Wire.setClock(100000);
+// --- SETUP DEDUPLICATION BLOCK ---
+    powerSensors(true);
     if (ds3231.begin(&Wire)) {
         if (ds3231.lostPower()) {
             ds3231.adjust(DateTime(F(__DATE__), F(__TIME__)) + TimeSpan(22)); 
         }
-        uint32_t dsEpoch = ds3231.now().unixtime();
-        stmRtc.setEpoch(dsEpoch);
     }
+    powerSensors(false);
 
-    if(!ina219.init()){ Serial.println("INA219 not connected!"); }
-    ina219.setShuntSizeInOhms(1.0);
-    ina219.setBusRange(INA219_BRNG_16);
-    ina219.setPGain(INA219_PG_40);
-    ina219.setADCMode(INA219_SAMPLE_MODE_128);
-    ina219.setMeasureMode(INA219_TRIGGERED);
-    ina219.startSingleMeasurementNoWait();
+    // Call readAllSensors directly to handle the first power-up and global populating
+    uint32_t dummyTime = 0;
+    readAllSensors(dummyTime); 
     
-    aht.begin();
-    bmp.begin();
-    bmp.setSampling(Adafruit_BMP280::MODE_FORCED, Adafruit_BMP280::SAMPLING_X2, Adafruit_BMP280::SAMPLING_X16, Adafruit_BMP280::FILTER_X16, Adafruit_BMP280::STANDBY_MS_500);
-
-    sensors_event_t humEvent, tempEvent;
-    aht.getEvent(&humEvent, &tempEvent);
-    gTemperature = tempEvent.temperature;
-    gHumidity = humEvent.relative_humidity;
-    bmp.takeForcedMeasurement();
-    gPressure = bmp.readPressure() / 100.0f;
-
-    float Temp = gTemperature;
-    float Humid = gHumidity;
-    gAbsHumidity = (6.112f * expf(((17.67f * Temp) / (Temp + 243.5f))) * Humid * 2.1674f) / (273.15f + Temp);
-    
-    uint32_t inaTimeout = millis();
-    while (!ina219.getConversionReady() && (millis() - inaTimeout < 100)) delay(1);
-    
-    gBatteryVoltage = ina219.getBusVoltage_V();
-    float current_mA = ina219.getCurrent_mA();
-    if (current_mA < 0.0f) current_mA = 0.0f;
-    gBatteryCurrent_uA = (uint32_t)(current_mA * 1000.0f + 0.5f);
-    
-    Wire.end();
-    delay(50); 
-    digitalWrite(PWR_SENSORS, LOW);
-
     bootEpoch = stmRtc.getEpoch();
     lastSensorRead = bootEpoch;
+    // ----------------------------------
 
     pinMode(PIN_LCD_TE, INPUT_ANALOG);
     pinMode(PIN_LCD_CS,  OUTPUT); digitalWrite(PIN_LCD_CS,  HIGH);
@@ -626,8 +717,15 @@ void setup() {
 
 void loop() {
     uint32_t now = stmRtc.getEpoch();
-    
-    static uint32_t lastDisplayTick = 0;
+      static uint32_t lastDisplayTick = 0;  
+    auto goMain = [&]() {
+        currentState = STATE_MAIN;
+        forceMainRedraw = true;  
+        now = stmRtc.getEpoch(); 
+        paintMainScreen(now);
+        lastDisplayTick = now;
+    };
+
     static uint32_t lastInteractionTime = 0;
     
     static bool lastUp = false;
@@ -637,28 +735,27 @@ void loop() {
     
     if (lastDisplayTick == 0) lastDisplayTick = now;
 
-    // --- 1. Process 1-Second Updates ---
     if (now != lastDisplayTick) {
         lastDisplayTick = now;
         
         if (now - lastSensorRead >= 60) {
             lastSensorRead = now;
 
-            // Push the current global readings into the circular buffer
             histTemp[histHead]   = gTemperature;
             histRH[histHead]     = gHumidity;
             histAbsHum[histHead] = gAbsHumidity;
             histPress[histHead]  = gPressure;
-            histVolt[histHead]   = gBatteryVoltage;
             histCur[histHead]    = (float)gBatteryCurrent_uA;
 
-            // Advance the head index and wrap around if necessary
             histHead = (histHead + 1) % MAX_SAMPLES;
-            
-            // Increment the total sample count until it fills the buffer
-            if (histCount < MAX_SAMPLES) {
-                histCount++;
+            if (histCount < MAX_SAMPLES) histCount++;
+
+            if (voltSampleCounter == 0) {
+                histVolt[voltHead] = gBatteryVoltage;
+                voltHead = (voltHead + 1) % MAX_SAMPLES;
+                if (voltCount < MAX_SAMPLES) voltCount++;
             }
+            voltSampleCounter = (voltSampleCounter + 1) % 60;
         }
 
         if (currentState == STATE_MAIN) {
@@ -666,14 +763,52 @@ void loop() {
         }
     }
 
-    // --- 2. Button Edge Detection ---
-    bool currUp = isPressed(BTN_UP);
+bool currUp = isPressed(BTN_UP);
     bool currDown = isPressed(BTN_DOWN);
     bool currLeft = isPressed(BTN_LEFT);
     bool currRight = isPressed(BTN_RIGHT);
 
-    bool pressUp    = currUp && !lastUp;
-    bool pressDown  = currDown && !lastDown;
+    // Timers for auto-repeat behavior
+    static uint32_t upHoldStart = 0;
+    static uint32_t lastUpRepeat = 0;
+    static uint32_t downHoldStart = 0;
+    static uint32_t lastDownRepeat = 0;
+    
+    // Auto-repeat timing thresholds
+    const uint32_t REPEAT_DELAY = 400; // milliseconds to hold before scrolling starts
+    const uint32_t REPEAT_RATE = 50;   // milliseconds between scroll ticks
+
+    // UP button logic (with auto-repeat)
+    bool pressUp = false;
+    if (currUp && !lastUp) {
+        pressUp = true;
+        upHoldStart = millis();
+        lastUpRepeat = millis();
+    } else if (currUp && lastUp) {
+        if (millis() - upHoldStart > REPEAT_DELAY) {
+            if (millis() - lastUpRepeat >= REPEAT_RATE) {
+                pressUp = true;
+                lastUpRepeat = millis();
+            }
+        }
+    }
+
+    // DOWN button logic (with auto-repeat)
+    bool pressDown = false;
+    if (currDown && !lastDown) {
+        pressDown = true;
+        downHoldStart = millis();
+        lastDownRepeat = millis();
+    } else if (currDown && lastDown) {
+        if (millis() - downHoldStart > REPEAT_DELAY) {
+            if (millis() - lastDownRepeat >= REPEAT_RATE) {
+                pressDown = true;
+                lastDownRepeat = millis();
+            }
+        }
+    }
+
+    // LEFT and RIGHT remain strictly single-press
     bool pressLeft  = currLeft && !lastLeft;
     bool pressRight = currRight && !lastRight;
 
@@ -682,7 +817,6 @@ void loop() {
     lastLeft = currLeft;
     lastRight = currRight;
 
-    // --- 3. UI Navigation ---
     if (currentState == STATE_MAIN) {
         if (pressRight) {
             currentState = STATE_MENU;
@@ -702,12 +836,9 @@ void loop() {
                 menuSelection = (menuSelection == NUM_MENU_ITEMS - 1) ? 0 : menuSelection + 1;
                 drawMenu();
             } else if (pressLeft) {
-                currentState = STATE_MAIN;
-                forceMainRedraw = true;  
-                paintMainScreen(now);
-                lastDisplayTick = now;
+                    goMain();
             } else if (pressRight) {
-                if (menuSelection == 6) { // "Set Time" Sub-menu
+                if (menuSelection == 6) { 
                     currentState = STATE_SET_TIME;
                     editingMinutes = false;
                     tempHour = (now % 86400) / 3600;
@@ -715,25 +846,24 @@ void loop() {
                     drawSetTime();
                 } else {
                     currentState = STATE_CHART;
+                    chartCursor = -1; 
                     drawChart(menuSelection);
                 }
             }
         }
     } 
-    // --- TIME SETTING STATE CONTROLS ---
     else if (currentState == STATE_SET_TIME) {
         if (pressUp || pressDown || pressLeft || pressRight) {
             lastInteractionTime = millis();
             
-            if (pressLeft) { // Cancel and go back
+            if (pressLeft) { 
                 currentState = STATE_MENU;
                 drawMenu();
             } else if (pressRight) {
                 if (!editingMinutes) {
-                    editingMinutes = true; // Switch context to editing minutes
+                    editingMinutes = true; 
                     drawSetTime();
                 } else {
-                    // Right arrow again: Save time and return to Main
                     digitalWrite(PWR_SENSORS, HIGH);
                     delay(100);
                     Wire.setSCL(I2C1_SCL); 
@@ -751,11 +881,7 @@ void loop() {
                     Wire.end();
                     digitalWrite(PWR_SENSORS, LOW);
                     
-                    currentState = STATE_MAIN;
-                    forceMainRedraw = true;  
-                    now = stmRtc.getEpoch(); // Get immediately updated time
-                    paintMainScreen(now);
-                    lastDisplayTick = now;
+                        goMain();
                 }
             } else if (pressUp) {
                 if (!editingMinutes) {
@@ -775,27 +901,31 @@ void loop() {
         }
     }
     else if (currentState == STATE_CHART) {
-        if (pressLeft) {
+        if (pressLeft || pressRight || pressUp || pressDown) {
             lastInteractionTime = millis();
-            currentState = STATE_MENU;
-            drawMenu();
-        } else if (pressUp || pressDown || pressRight) {
-            currentState = STATE_MAIN;
-            forceMainRedraw = true;  
-            paintMainScreen(now);
-            lastDisplayTick = now;
+            uint16_t cCount = (menuSelection == 4) ? voltCount : histCount;
+
+            if (pressLeft) {
+                currentState = STATE_MENU;
+                drawMenu();
+            } else if (pressRight) {
+                        goMain();
+            } else if (pressUp) { 
+                if (chartCursor == -1) chartCursor = cCount - 1;
+                if (chartCursor < cCount - 1) chartCursor++;
+                drawChart(menuSelection);
+            } else if (pressDown) { 
+                if (chartCursor == -1) chartCursor = cCount - 1;
+                if (chartCursor > 0) chartCursor--;
+                drawChart(menuSelection);
+            }
         }
     }
 
-    // --- 4. Auto-Exit Menu (Battery Protection) ---
     if (currentState != STATE_MAIN && (millis() - lastInteractionTime > 15000)) {
-        currentState = STATE_MAIN;
-        forceMainRedraw = true;      
-        paintMainScreen(now);
-        lastDisplayTick = now;
+                goMain();
     }
 
-    // --- 5. Power Management ---
     if (currentState == STATE_MAIN) {
         SPI.end(); 
         sleepPins(); 
