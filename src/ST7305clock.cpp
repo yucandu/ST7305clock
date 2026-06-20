@@ -121,7 +121,7 @@ float gHumidity = 0.0f;
 float gPressure = 1013.25f;
 float gAbsHumidity = 0.0f;
 float gBatteryVoltage = 0.0f;
-uint32_t gBatteryCurrent_uA = 0;
+int32_t gBatteryCurrent_uA = 0;
 
 uint32_t bootEpoch = 0;
 uint32_t lastSensorRead = 0;
@@ -180,7 +180,7 @@ void prepDisplay() {
 void powerSensors(bool state) {
     if (state) {
         digitalWrite(PWR_SENSORS, HIGH);
-        delay(100);
+        delay(10);
         Wire.setSCL(I2C1_SCL); 
         Wire.setSDA(I2C1_SDA); 
         Wire.begin();
@@ -274,7 +274,7 @@ void paintMainScreen(uint32_t now) {
         snprintf(humBuf, sizeof(humBuf), "%d%% %d.%dg", h_int, ah_int, ah_frac);
         snprintf(pressureBuf, sizeof(pressureBuf), "%d.%dmB", p_int, p_frac);
         snprintf(voltBuf, sizeof(voltBuf), "%d.%03dv", v_int, v_frac);
-        snprintf(curBuf, sizeof(curBuf), "%luuA", (unsigned long)gBatteryCurrent_uA);
+        snprintf(curBuf, sizeof(curBuf), "%lduA", (long)gBatteryCurrent_uA);
         
         if (uptimeDays > 365) {
             uint32_t uptimeYears = uptimeDays / 365;
@@ -398,9 +398,16 @@ void drawChart(int chartIndex) {
         if(dataArr[idx] < minV) minV = dataArr[idx];
         if(dataArr[idx] > maxV) maxV = dataArr[idx];
     }
-    if(maxV - minV < 0.001f) { 
-        maxV += 1.0f;
-        minV -= 1.0f;
+// Tightened the threshold so a 0.001v drop won't falsely trigger the padding.
+    // If it is completely flat, pad voltage by a small margin, otherwise use 1.0.
+    if(maxV - minV < 0.0001f) { 
+        if (chartIndex == 4) {
+            maxV += 0.005f;
+            minV -= 0.005f;
+        } else {
+            maxV += 1.0f;
+            minV -= 1.0f;
+        }
     }
 
     u8g2.setFont(u8g2_font_profont17_tr);
@@ -425,11 +432,19 @@ void drawChart(int chartIndex) {
     float midV = (maxV + minV) / 2.0f;
     
     // Helper to safely format floats to 1 decimal place without %f
-    auto fmtFloat1 = [&](float v) {
+// Helper to safely format floats without %f
+    auto fmtFloat = [&](float v) {
         int i = (int)v;
-        int f = abs((int)(v * 10.0f)) % 10;
         const char* sign = (v < 0 && i == 0) ? "-" : "";
-        snprintf(buf, sizeof(buf), "%s%d.%d", sign, i, f);
+        if (chartIndex == 4) {
+            // 3 decimal places for Voltage
+            int f = abs((int)(v * 1000.0f)) % 1000;
+            snprintf(buf, sizeof(buf), "%s%d.%03d", sign, i, f);
+        } else {
+            // 1 decimal place for everything else
+            int f = abs((int)(v * 10.0f)) % 10;
+            snprintf(buf, sizeof(buf), "%s%d.%d", sign, i, f);
+        }
     };
 
     // Y-Axis Ticks
@@ -438,15 +453,15 @@ void drawChart(int chartIndex) {
     u8g2.drawLine(xStart - 4, yBottom, xStart, yBottom);
 
     // Y-Axis Labels (Right-aligned to the tick marks)
-    fmtFloat1(maxV);
+    fmtFloat(maxV);
     int tw = u8g2.getStrWidth(buf);
     u8g2.drawStr(xStart - 6 - tw, yTop + 3, buf);
     
-    fmtFloat1(midV);
+    fmtFloat(midV);
     tw = u8g2.getStrWidth(buf);
     u8g2.drawStr(xStart - 6 - tw, yMid + 3, buf);
 
-    fmtFloat1(minV);
+    fmtFloat(minV);
     tw = u8g2.getStrWidth(buf);
     u8g2.drawStr(xStart - 6 - tw, yBottom, buf);
 
@@ -529,13 +544,19 @@ void drawChart(int chartIndex) {
         uint32_t h24 = (pointTime % 86400) / 3600;
         uint32_t m = (pointTime % 3600) / 60;
         
-        // Format cursor value manually (2 decimal places) avoiding %f
+// Format cursor value manually avoiding %f
         int val_i = (int)cursorVal;
-        int val_f = abs((int)(cursorVal * 100.0f)) % 100;
         const char* sign = (cursorVal < 0 && val_i == 0) ? "-" : "";
         
-        // Output format: e.g., "24.53 @ 14:27"
-        snprintf(buf, sizeof(buf), "%s%d.%02d @ %02lu:%02lu", sign, val_i, val_f, (unsigned long)h24, (unsigned long)m);
+        if (chartIndex == 4) {
+            // 3 decimals for Voltage: "4.125 @ 14:27"
+            int val_f = abs((int)(cursorVal * 1000.0f)) % 1000;
+            snprintf(buf, sizeof(buf), "%s%d.%03d @ %02lu:%02lu", sign, val_i, val_f, (unsigned long)h24, (unsigned long)m);
+        } else {
+            // 2 decimals for other sensors: "24.53 @ 14:27"
+            int val_f = abs((int)(cursorVal * 100.0f)) % 100;
+            snprintf(buf, sizeof(buf), "%s%d.%02d @ %02lu:%02lu", sign, val_i, val_f, (unsigned long)h24, (unsigned long)m);
+        }
         
         int valW = u8g2.getStrWidth(buf);
         
@@ -622,7 +643,7 @@ powerSensors(true);
     gBatteryVoltage = ina219.getBusVoltage_V();
     float current_mA = ina219.getCurrent_mA();
    // if (current_mA < 0.0f) current_mA = 0.0f;
-    gBatteryCurrent_uA = (uint32_t)(current_mA * 1000.0f + 0.5f);
+    gBatteryCurrent_uA = (int32_t)(current_mA * 1000.0f + (current_mA > 0.0f ? 0.5f : -0.5f));
     
 powerSensors(false);
 
@@ -668,9 +689,9 @@ void setup() {
 // --- SETUP DEDUPLICATION BLOCK ---
     powerSensors(true);
     if (ds3231.begin(&Wire)) {
-        if (ds3231.lostPower()) {
-            ds3231.adjust(DateTime(F(__DATE__), F(__TIME__)) + TimeSpan(22)); 
-        }
+        //if (ds3231.lostPower()) {
+          //  ds3231.adjust(DateTime(F(__DATE__), F(__TIME__)) + TimeSpan(22)); 
+        //}
     }
     powerSensors(false);
 
@@ -865,7 +886,7 @@ bool currUp = isPressed(BTN_UP);
                     drawSetTime();
                 } else {
                     digitalWrite(PWR_SENSORS, HIGH);
-                    delay(100);
+                    delay(10);
                     Wire.setSCL(I2C1_SCL); 
                     Wire.setSDA(I2C1_SDA); 
                     Wire.begin();
@@ -943,6 +964,6 @@ bool currUp = isPressed(BTN_UP);
         wakePins(); 
         SPI.begin(); 
     } else {
-        delay(50); 
+        delay(20); 
     }
 }
