@@ -62,13 +62,25 @@ bool editingMinutes = false;
 int8_t tempHour = 0;
 int8_t tempMinute = 0;
 
-#define MAX_SAMPLES 400
-float histTemp[MAX_SAMPLES];
-float histRH[MAX_SAMPLES];
-float histAbsHum[MAX_SAMPLES];
-float histPress[MAX_SAMPLES];
-float histVolt[MAX_SAMPLES];
-float histCur[MAX_SAMPLES];
+#define MAX_SAMPLES 1440
+// 1. Temperature: -327.68 to +327.67 C (Multiply by 100)
+int16_t histTemp[MAX_SAMPLES];      // 2 bytes per sample
+
+// 2. Relative Humidity: 0.00 to 100.00% 
+uint16_t histRH[MAX_SAMPLES];        // 2 bytes per sample
+
+// 3. Absolute Humidity: 0.00 to 655.35 g/m3 (Multiply by 100)
+uint16_t histAbsHum[MAX_SAMPLES];   // 2 bytes per sample
+
+// 4. Pressure: 0.0 to 6553.5 mB (Multiply by 10)
+uint16_t histPress[MAX_SAMPLES];    // 2 bytes per sample
+
+// 5. Voltage: 0.000V to 65.535V (Multiply by 1000)
+uint16_t histVolt[MAX_SAMPLES];     // 2 bytes per sample
+
+// 6. Current: ±32,767 uA 
+// (If your current exceeds 32mA, divide by 10 here to store up to 327mA)
+int16_t histCur[MAX_SAMPLES];       // 2 bytes per sample
 
 uint16_t histHead = 0;
 uint16_t histCount = 0;
@@ -203,7 +215,7 @@ void sendBufferDirect() {
     SPI.endTransaction();
 }
 
-static uint8_t partialBuf[1500];
+static uint8_t partialBuf[768];
 bool forceMainRedraw = false;
 void sendPartialBuffer() {
     uint8_t devXStart = 60, devXEnd = 120;
@@ -368,38 +380,50 @@ void drawSetTime() {
     sendBufferDirect();
 }
 
+float getHistValue(int chartIndex, int rawIdx) {
+    // Determine the actual index in the circular buffer
+    uint16_t cCount = (chartIndex == 4) ? voltCount : histCount;
+    uint16_t cHead  = (chartIndex == 4) ? voltHead : histHead;
+    int idx = (cCount < MAX_SAMPLES) ? rawIdx : (cHead + rawIdx) % MAX_SAMPLES;
+
+    // Fetch and un-scale
+    switch(chartIndex) {
+        case 0: return histTemp[idx] / 100.0f;
+        case 1: return histRH[idx] / 100.0f;
+        case 2: return histAbsHum[idx] / 100.0f;
+        case 3: return histPress[idx] / 10.0f;
+        case 4: return histVolt[idx] / 1000.0f;
+        case 5: return (float)histCur[idx];
+        default: return 0.0f;
+    }
+}
+
 void drawChart(int chartIndex) {
     prepDisplay();
 
-    float* dataArr = histTemp;
-    uint16_t cCount = histCount;
-    uint16_t cHead = histHead;
-    
-    if(chartIndex == 1) dataArr = histRH;
-    else if(chartIndex == 2) dataArr = histAbsHum;
-    else if(chartIndex == 3) dataArr = histPress;
-    else if(chartIndex == 4) {
-        dataArr = histVolt;
-        cCount = voltCount;
-        cHead = voltHead;
-    }
-    else if(chartIndex == 5) dataArr = histCur;
+    // 1. Get the count. The getHistValue() helper handles the rest.
+    uint16_t cCount = (chartIndex == 4) ? voltCount : histCount;
 
+    // Bail out if there is no data yet
     if (cCount == 0) {
         sendBufferDirect();
         return;
     }
 
+    // 2. The Min/Max Loop: 
+    // Scan the history to find the bounds for the Y-Axis
     float minV = 99999.0f;
     float maxV = -99999.0f;
 
     for(int i = 0; i < cCount; i++) {
-        int idx = (cCount < MAX_SAMPLES) ? i : (cHead + i) % MAX_SAMPLES;
-        if(dataArr[idx] < minV) minV = dataArr[idx];
-        if(dataArr[idx] > maxV) maxV = dataArr[idx];
+        // Use our new helper function instead of dataArr!
+        float val = getHistValue(chartIndex, i);
+        
+        if(val < minV) minV = val;
+        if(val > maxV) maxV = val;
     }
-// Tightened the threshold so a 0.001v drop won't falsely trigger the padding.
-    // If it is completely flat, pad voltage by a small margin, otherwise use 1.0.
+
+    // Tightened the threshold so a 0.001v drop won't falsely trigger the padding.
     if(maxV - minV < 0.0001f) { 
         if (chartIndex == 4) {
             maxV += 0.005f;
@@ -409,6 +433,8 @@ void drawChart(int chartIndex) {
             minV -= 1.0f;
         }
     }
+    
+    // ... the rest of your chart drawing code continues here ...
 
     u8g2.setFont(u8g2_font_profont17_tr);
     int titleW = u8g2.getStrWidth(menuItems[chartIndex]);
@@ -495,9 +521,12 @@ void drawChart(int chartIndex) {
     if (chartCursor < 0 && cCount > 0) chartCursor = cCount - 1;
 
     for(int i = 0; i < cCount; i++) {
-        int idx = (cCount < MAX_SAMPLES) ? i : (cHead + i) % MAX_SAMPLES;
-        float val = dataArr[idx];
+        // 1. Delete the "int idx = ..." line entirely!
         
+        // 2. Just ask our helper function for the value at step 'i'
+        float val = getHistValue(chartIndex, i);
+        
+        // 3. The rest of your X/Y math stays exactly the same
         int x = xStart + 2 + (i * (xEnd - xStart - 4)) / (cCount > 1 ? cCount - 1 : 1);
         int y = yBottom - 2 - ((val - minV) * (yBottom - yTop - 4) / (maxV - minV));
         
@@ -762,17 +791,18 @@ void loop() {
         if (now - lastSensorRead >= 60) {
             lastSensorRead = now;
 
-            histTemp[histHead]   = gTemperature;
-            histRH[histHead]     = gHumidity;
-            histAbsHum[histHead] = gAbsHumidity;
-            histPress[histHead]  = gPressure;
-            histCur[histHead]    = (float)gBatteryCurrent_uA;
+            // Scale and cast to integers before saving
+            histTemp[histHead]   = (int16_t)(gTemperature * 100.0f);
+            histRH[histHead]     = (uint16_t)(gHumidity * 100.0f); 
+            histAbsHum[histHead] = (uint16_t)(gAbsHumidity * 100.0f);
+            histPress[histHead]  = (uint16_t)(gPressure * 10.0f);
+            histCur[histHead]    = (int16_t)gBatteryCurrent_uA;
 
             histHead = (histHead + 1) % MAX_SAMPLES;
             if (histCount < MAX_SAMPLES) histCount++;
 
             if (voltSampleCounter == 0) {
-                histVolt[voltHead] = gBatteryVoltage;
+                histVolt[voltHead] = (uint16_t)(gBatteryVoltage * 1000.0f);
                 voltHead = (voltHead + 1) % MAX_SAMPLES;
                 if (voltCount < MAX_SAMPLES) voltCount++;
             }
