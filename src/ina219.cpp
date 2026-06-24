@@ -37,7 +37,7 @@ void ina219_startSingle(void) {
 bool ina219_conversionReady(void) {
     uint16_t bus;
     if (!read_reg16(REG_BUS, &bus)) return false;
-    return (bus & 0x04) != 0;
+    return (bus & 0x02) != 0;
 }
 
 float ina219_getBusVoltage(void) {

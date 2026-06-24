@@ -145,12 +145,20 @@ static const uint8_t map2[16] = {
     0x40,0x41,0x44,0x45,0x50,0x51,0x54,0x55
 };
 
-void convertBuffer() {
+
+void convertBuffer(uint8_t startTileRow = 0, uint8_t endTileRow = 47) {
     uint8_t *src = u8g2.getBufferPtr();
     uint8_t *dst = convertedBuf;
+
+    // dst is sequential output, so it needs fast-forwarding to the start row.
+    // src does NOT — tileBase below already computes an absolute offset from
+    // the (unshifted) src base using the full tileRow value, so pre-shifting
+    // src here would double-count the offset and read from the wrong rows.
+    dst += (startTileRow * 168);
+
     const uint8_t tileWidth = 21;
     const uint8_t tileHeight = 48;
-    for (uint8_t tileRow = 0; tileRow < tileHeight; tileRow++) {
+    for (uint8_t tileRow = startTileRow; tileRow <= endTileRow; tileRow++) {
         uint8_t *tileBase = src + tileRow * tileWidth * 8;
         for (uint8_t i = 0; i < 4; i++) {
             uint8_t *ptr = tileBase + tileWidth * i * 2;
@@ -343,7 +351,7 @@ void paintMainScreen(uint32_t now) {
         u8g2.setFont(u8g2_font_logisoso62_tn);
         u8g2.drawStr(236, 126, secsBuf);
 
-        convertBuffer();
+        convertBuffer(8, 18);
         sendPartialBuffer();
     }
 }
@@ -642,7 +650,7 @@ void wakePins() {
 }
 
 void readAllSensors(uint32_t &now) {
-powerSensors(true); 
+    powerSensors(true); 
     if (ds3231_begin()) {
         DateTime dt = ds3231_now();
         stmRtc.setEpoch(dt.unixtime());
@@ -658,22 +666,31 @@ powerSensors(true);
     aht20_begin();
     bmp280_begin();
 
-    aht20_read(&gTemperature, &gHumidity);
-    gPressure = bmp280_readPressure() / 100.0f;
+    // 1. TRIGGER ALL SENSORS
+    aht20_trigger();
+    bmp280_trigger();
+    
+    // 2. WAIT ONCE (80ms covers the slowest sensor, the AHT20)
+    delay(80); 
+
+    // 3. COLLECT ALL SENSORS
+    aht20_collect(&gTemperature, &gHumidity);
+    gPressure = bmp280_collect() / 100.0f;
 
     float Temp = gTemperature;
     float Humid = gHumidity;
     gAbsHumidity = (6.112f * expf(((17.67f * Temp) / (Temp + 243.5f))) * Humid * 2.1674f) / (273.15f + Temp);
     
+    // INA219 max conversion time is ~68ms, so it is almost certainly ready, 
+    // but we keep a tiny timeout just in case the I2C bus stalls.
     uint32_t inaTimeout = millis();
-    while (!ina219_conversionReady() && (millis() - inaTimeout < 100)) delay(1);
+    while (!ina219_conversionReady() && (millis() - inaTimeout < 150)) delay(1);
     
     gBatteryVoltage = ina219_getBusVoltage();
     float current_mA = ina219_getCurrent();
     gBatteryCurrent_uA = (int32_t)(current_mA * 1000.0f + (current_mA > 0.0f ? 0.5f : -0.5f));
     
-powerSensors(false);
-
+    powerSensors(false);
 }
 
 volatile bool btnWakeFlag = false;
@@ -697,7 +714,7 @@ void setup() {
     pinMode(PB5,  INPUT_ANALOG);
 
     RCC->AHB2ENR |= RCC_AHB2ENR_GPIOAEN;
-    //GPIOA->MODER |= (GPIO_MODER_MODE13 | GPIO_MODER_MODE14);
+    GPIOA->MODER |= (GPIO_MODER_MODE13 | GPIO_MODER_MODE14);
     pinMode(PA_15, INPUT_ANALOG); 
 
     pinMode(PC14, INPUT_ANALOG); 
@@ -753,7 +770,11 @@ void setup() {
     paintMainScreen(stmRtc.getEpoch());
     
     sleepPins();
-    //HAL_DBGMCU_DisableDBGStopMode();
+    HAL_DBGMCU_DisableDBGStopMode();
+
+    // Reconfigure SWDIO (PA13) and SWCLK (PA14) to Analog to prevent floating leakage
+  //  pinMode(PA_13, INPUT_ANALOG);
+  //  pinMode(PA_14, INPUT_ANALOG);
     LowPower.begin();
     stmRtc.attachInterrupt(alarmMatch); 
 }

@@ -85,11 +85,25 @@ void ds3231_adjust(const DateTime &dt) {
     buf[1] = bin2bcd(dt._second);
     buf[2] = bin2bcd(dt._minute);
     buf[3] = bin2bcd(dt._hour);
-    buf[4] = 0;
+    buf[4] = 0; // Day of week (1-7), often ignored
     buf[5] = bin2bcd(dt._day);
     buf[6] = bin2bcd(dt._month);
     buf[7] = bin2bcd(dt._year % 100);
     i2c_write(DS3231_ADDR, buf, 8);
+
+    // --- NEW FIX: Clear the Oscillator Stop Flag (OSF) ---
+    uint8_t reg = 0x0F;
+    uint8_t status;
+    
+    // Read the current status register
+    if (i2c_writeread(DS3231_ADDR, &reg, 1, &status, 1)) {
+        // Clear bit 7 (OSF) while leaving other bits (like alarms) intact
+        status &= ~0x80; 
+        
+        // Write it back to register 0x0F
+        uint8_t write_buf[2] = {0x0F, status};
+        i2c_write(DS3231_ADDR, write_buf, 2);
+    }
 }
 
 bool ds3231_lostPower(void) {

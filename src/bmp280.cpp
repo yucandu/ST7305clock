@@ -14,6 +14,41 @@ typedef struct {
 
 static bmp280_cal_t cal;
 
+
+float bmp280_collect(void) {
+    // Note: No try_addr or delay() here!
+    uint8_t reg = 0xFA;
+    uint8_t tbuf[3];
+    if (!i2c_writeread(bmp_addr, &reg, 1, tbuf, 3)) return 0;
+
+    int32_t adc_T = ((int32_t)tbuf[0] << 12) | ((int32_t)tbuf[1] << 4) | (tbuf[2] >> 4);
+
+    float var1, var2;
+    var1 = ((float)adc_T / 16384.0f - (float)cal.dig_T1 / 1024.0f) * (float)cal.dig_T2;
+    var2 = (((float)adc_T / 131072.0f - (float)cal.dig_T1 / 8192.0f) *
+            ((float)adc_T / 131072.0f - (float)cal.dig_T1 / 8192.0f)) * (float)cal.dig_T3;
+    cal.t_fine = (int32_t)(var1 + var2);
+
+    reg = 0xF7;
+    uint8_t pbuf[3];
+    if (!i2c_writeread(bmp_addr, &reg, 1, pbuf, 3)) return 0;
+
+    int32_t adc_P = ((int32_t)pbuf[0] << 12) | ((int32_t)pbuf[1] << 4) | (pbuf[2] >> 4);
+    if (adc_P == 0x800000 || adc_P == 0) return 0;
+
+    var1 = ((float)cal.t_fine / 2.0f) - 64000.0f;
+    var2 = var1 * var1 * (float)cal.dig_P6 / 32768.0f;
+    var2 = var2 + var1 * (float)cal.dig_P5 * 2.0f;
+    var2 = var2 / 4.0f + (float)cal.dig_P4 * 65536.0f;
+    var1 = ((float)cal.dig_P3 * var1 * var1 / 524288.0f + (float)cal.dig_P2 * var1) / 524288.0f;
+    var1 = (1.0f + var1 / 32768.0f) * (float)cal.dig_P1;
+    if (var1 < 1.0f) return 0;
+
+    float p = 1048576.0f - (float)adc_P;
+    p = (p - var2 / 4096.0f) * 6250.0f / var1;
+    return p;
+}
+
 bool bmp280_begin(void) {
     uint8_t addrs[2] = {0x77, 0x76};
     uint8_t id;
@@ -94,4 +129,9 @@ float bmp280_readPressure(void) {
     float p = 1048576.0f - (float)adc_P;
     p = (p - var2 / 4096.0f) * 6250.0f / var1;
     return p;
+}
+
+
+bool bmp280_trigger(void) {
+    return try_addr(bmp_addr);
 }
