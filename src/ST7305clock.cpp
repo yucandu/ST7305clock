@@ -3,22 +3,18 @@
 #include <Arduino.h>
 #include <U8g2lib.h>
 #include <SPI.h>
-#include <Wire.h>
 #include "STM32LowPower.h"
 #include "STM32RTC.h"
-#include <RTClib.h>
-#include <INA219_WE.h>
-#include <Adafruit_AHTX0.h>
-#include <Adafruit_BMP280.h>
+#include "i2c_driver.h"
+#include "ds3231.h"
+#include "ina219.h"
+#include "aht20.h"
+#include "bmp280.h"
 #include "monochromebg_rle.h"
 
 extern "C" float expf(float);
 
 STM32RTC& stmRtc = STM32RTC::getInstance();
-RTC_DS3231 ds3231;
-INA219_WE ina219(0x40);
-Adafruit_AHTX0 aht;
-Adafruit_BMP280 bmp;
 
 extern "C" void SystemClock_Config(void) {
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
@@ -35,8 +31,6 @@ extern "C" void SystemClock_Config(void) {
     HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1);
 }
 
-#define I2C1_SCL        PB6
-#define I2C1_SDA        PB7
 #define PWR_SENSORS     PB0
 #define PIN_LCD_SCLK    PA5
 #define PIN_LCD_MOSI    PA7
@@ -137,6 +131,8 @@ int32_t gBatteryCurrent_uA = 0;
 
 uint32_t bootEpoch = 0;
 uint32_t lastSensorRead = 0;
+uint32_t gLastSyncedEpoch = 0;
+uint32_t gLastSyncStmEpoch = 0;
 
 static uint8_t convertedBuf[8064];
 
@@ -193,12 +189,9 @@ void powerSensors(bool state) {
     if (state) {
         digitalWrite(PWR_SENSORS, HIGH);
         delay(10);
-        Wire.setSCL(I2C1_SCL); 
-        Wire.setSDA(I2C1_SDA); 
-        Wire.begin();
-        Wire.setClock(100000);
+        i2c_init();
     } else {
-        Wire.end();
+        i2c_deinit();
         digitalWrite(PWR_SENSORS, LOW);
     }
 }
@@ -247,26 +240,36 @@ SPI.beginTransaction(SPISettings(12000000, MSBFIRST, SPI_MODE0));
 }
 
 void paintMainScreen(uint32_t now) {
-    uint32_t seconds = now % 60;
-    char secsBuf[4];
-    snprintf(secsBuf, sizeof(secsBuf), "%02u", seconds);
     uint32_t uptimeSecs = now - bootEpoch;
+    uint32_t seconds;
+
+    if (gLastSyncedEpoch != 0 && gLastSyncStmEpoch != 0) {
+        uint32_t elapsed = now - gLastSyncStmEpoch;
+        seconds = (gLastSyncedEpoch + elapsed) % 60;
+    } else {
+        seconds = now % 60;
+    }
 
     if (seconds == 0 || uptimeSecs == 0 || forceMainRedraw) {
         readAllSensors(now);
         forceMainRedraw = false;
+        
+        uptimeSecs = now - bootEpoch;
         uint32_t uptimeDays  = uptimeSecs / 86400;
         uint32_t uptimeHours = (uptimeSecs % 86400) / 3600;
         uint32_t uptimeMins  = (uptimeSecs % 3600) / 60;
+        
         uint32_t hours24 = (now % 86400) / 3600;
         uint32_t minutes = (now % 3600) / 60;
+        seconds = now % 60;
         
         uint8_t h12 = hours24 % 12;
         if (h12 == 0) h12 = 12;
         bool pm = hours24 >= 12;
 
-        char timeMainBuf[12], tempBuf[16], humBuf[24], pressureBuf[16], voltBuf[16], curBuf[16], uptimeBuf[20];
+        char timeMainBuf[12], secsBuf[4], tempBuf[16], humBuf[24], pressureBuf[16], voltBuf[16], curBuf[16], uptimeBuf[20];
         snprintf(timeMainBuf, sizeof(timeMainBuf), "%u:%02u:", h12, minutes);
+        snprintf(secsBuf, sizeof(secsBuf), "%02u", seconds);
 
         int t_int = (int)gTemperature;
         int t_frac = abs((int)(gTemperature * 10.0f)) % 10;
@@ -331,6 +334,9 @@ void paintMainScreen(uint32_t now) {
         
         sendBufferDirect();
     } else {
+        char secsBuf[4];
+        snprintf(secsBuf, sizeof(secsBuf), "%02u", seconds);
+        
         u8g2.setDrawColor(0); 
         u8g2.clearBuffer();
         u8g2.setDrawColor(1);
@@ -636,42 +642,34 @@ void wakePins() {
 }
 
 void readAllSensors(uint32_t &now) {
-powerSensors(true);
-    if (ds3231.begin(&Wire)) {
-        DateTime dt = ds3231.now();
+powerSensors(true); 
+    if (ds3231_begin()) {
+        DateTime dt = ds3231_now();
         stmRtc.setEpoch(dt.unixtime());
         now = dt.unixtime();
+        gLastSyncedEpoch = dt.unixtime();
+        gLastSyncStmEpoch = stmRtc.getEpoch();
     }
 
-    if(!ina219.init()){ }
-    ina219.setShuntSizeInOhms(1.0);
-    ina219.setBusRange(INA219_BRNG_16);
-    ina219.setPGain(INA219_PG_40);
-    ina219.setADCMode(INA219_SAMPLE_MODE_128);
-    ina219.setMeasureMode(INA219_TRIGGERED);
-    ina219.startSingleMeasurementNoWait();
+    ina219_init();
+    ina219_configure();
+    ina219_startSingle();
     
-    aht.begin();
-    bmp.begin();
-    bmp.setSampling(Adafruit_BMP280::MODE_FORCED, Adafruit_BMP280::SAMPLING_X2, Adafruit_BMP280::SAMPLING_X16, Adafruit_BMP280::FILTER_X16, Adafruit_BMP280::STANDBY_MS_500);
+    aht20_begin();
+    bmp280_begin();
 
-    sensors_event_t humEvent, tempEvent;
-    aht.getEvent(&humEvent, &tempEvent);
-    gTemperature = tempEvent.temperature;
-    gHumidity = humEvent.relative_humidity;
-    bmp.takeForcedMeasurement();
-    gPressure = bmp.readPressure() / 100.0f;
+    aht20_read(&gTemperature, &gHumidity);
+    gPressure = bmp280_readPressure() / 100.0f;
 
     float Temp = gTemperature;
     float Humid = gHumidity;
     gAbsHumidity = (6.112f * expf(((17.67f * Temp) / (Temp + 243.5f))) * Humid * 2.1674f) / (273.15f + Temp);
     
     uint32_t inaTimeout = millis();
-    while (!ina219.getConversionReady() && (millis() - inaTimeout < 100)) delay(1);
+    while (!ina219_conversionReady() && (millis() - inaTimeout < 100)) delay(1);
     
-    gBatteryVoltage = ina219.getBusVoltage_V();
-    float current_mA = ina219.getCurrent_mA();
-   // if (current_mA < 0.0f) current_mA = 0.0f;
+    gBatteryVoltage = ina219_getBusVoltage();
+    float current_mA = ina219_getCurrent();
     gBatteryCurrent_uA = (int32_t)(current_mA * 1000.0f + (current_mA > 0.0f ? 0.5f : -0.5f));
     
 powerSensors(false);
@@ -689,8 +687,6 @@ bool isPressed(uint32_t pin) {
 }
 
 void setup() {
-    Wire.setSCL(I2C1_SCL);
-    Wire.setSDA(I2C1_SDA);
 
     pinMode(PA10, INPUT_ANALOG); 
     pinMode(PA9,  INPUT_ANALOG);  
@@ -701,7 +697,7 @@ void setup() {
     pinMode(PB5,  INPUT_ANALOG);
 
     RCC->AHB2ENR |= RCC_AHB2ENR_GPIOAEN;
-    GPIOA->MODER |= (GPIO_MODER_MODE13 | GPIO_MODER_MODE14);
+    //GPIOA->MODER |= (GPIO_MODER_MODE13 | GPIO_MODER_MODE14);
     pinMode(PA_15, INPUT_ANALOG); 
 
     pinMode(PC14, INPUT_ANALOG); 
@@ -717,9 +713,9 @@ void setup() {
 
 // --- SETUP DEDUPLICATION BLOCK ---
     powerSensors(true);
-    if (ds3231.begin(&Wire)) {
-        //if (ds3231.lostPower()) {
-          //  ds3231.adjust(DateTime(F(__DATE__), F(__TIME__)) + TimeSpan(22)); 
+    if (ds3231_begin()) {
+       // if (ds3231_lostPower()) {
+         //   ds3231_adjust(DateTime((uint32_t)(BUILD_EPOCH - 14340)));
         //}
     }
     powerSensors(false);
@@ -749,9 +745,6 @@ void setup() {
     GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_LOW;
     GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-    GPIO_InitStruct.Pin       = GPIO_PIN_6 | GPIO_PIN_7;
-    GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
     u8g2.sendF("c", 0x39);
     u8g2.sendF("ca", 0xB2, 0x00);
@@ -760,7 +753,7 @@ void setup() {
     paintMainScreen(stmRtc.getEpoch());
     
     sleepPins();
-    HAL_DBGMCU_DisableDBGStopMode();
+    //HAL_DBGMCU_DisableDBGStopMode();
     LowPower.begin();
     stmRtc.attachInterrupt(alarmMatch); 
 }
@@ -917,19 +910,16 @@ bool currUp = isPressed(BTN_UP);
                 } else {
                     digitalWrite(PWR_SENSORS, HIGH);
                     delay(10);
-                    Wire.setSCL(I2C1_SCL); 
-                    Wire.setSDA(I2C1_SDA); 
-                    Wire.begin();
-                    Wire.setClock(100000);
+                    i2c_init();
                     
-                    if (ds3231.begin(&Wire)) {
-                        DateTime dt = ds3231.now();
+                    if (ds3231_begin()) {
+                        DateTime dt = ds3231_now();
                         DateTime newTime(dt.year(), dt.month(), dt.day(), tempHour, tempMinute, 0);
-                        ds3231.adjust(newTime);
+                        ds3231_adjust(newTime);
                         stmRtc.setEpoch(newTime.unixtime());
                     }
                     
-                    Wire.end();
+                    i2c_deinit();
                     digitalWrite(PWR_SENSORS, LOW);
                     
                         goMain();
