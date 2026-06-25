@@ -1,4 +1,4 @@
-//STM32L412K8T6
+//STM32L412K8T6 
 
 #include <Arduino.h>
 #include <U8g2lib.h>
@@ -49,8 +49,10 @@ extern "C" void SystemClock_Config(void) {
 enum AppState { STATE_MAIN, STATE_MENU, STATE_CHART, STATE_SET_TIME };
 AppState currentState = STATE_MAIN;
 int8_t menuSelection = 0;
-const char* menuItems[7] = {"Temperature", "Rel Humidity", "Abs Humidity", "Pressure", "Voltage", "Current", "Set Time"};
-const int8_t NUM_MENU_ITEMS = 7;
+int8_t menuScrollOffset = 0;
+const int8_t MENU_VISIBLE = 7;
+const char* menuItems[9] = {"Temperature", "Rel Humidity", "Abs Humidity", "Pressure", "Voltage", "Current", "Set Time", "Reset Data", "Reset System"};
+const int8_t NUM_MENU_ITEMS = 9;
 
 bool editingMinutes = false;
 int8_t tempHour = 0;
@@ -66,7 +68,8 @@ uint16_t histRH[MAX_SAMPLES];        // 2 bytes per sample
 // 3. Absolute Humidity: 0.00 to 655.35 g/m3 (Multiply by 100)
 uint16_t histAbsHum[MAX_SAMPLES];   // 2 bytes per sample
 
-// 4. Pressure: 0.0 to 6553.5 mB (Multiply by 10)
+// 4. Pressure: encoded with bit 15 = hundreds is 10 (vs 9), bits 0-14 = remainder*100 (0.00-99.99)
+//    Range: 900.00-1099.99 hPa at 0.01 hPa resolution
 uint16_t histPress[MAX_SAMPLES];    // 2 bytes per sample
 
 // 5. Voltage: 0.000V to 65.535V (Multiply by 1000)
@@ -288,14 +291,14 @@ void paintMainScreen(uint32_t now) {
         int ah_frac = abs((int)(gAbsHumidity * 10.0f)) % 10;
 
         int p_int = (int)gPressure;
-        int p_frac = abs((int)(gPressure * 10.0f)) % 10;
+        int p_frac = abs((int)(gPressure * 100.0f)) % 100;
 
         int v_int = (int)gBatteryVoltage;
         int v_frac = abs((int)(gBatteryVoltage * 1000.0f)) % 1000;
 
         snprintf(tempBuf, sizeof(tempBuf), "%s%d.%d\xc2\xb0" "C", t_sign, t_int, t_frac);
         snprintf(humBuf, sizeof(humBuf), "%d%% %d.%dg", h_int, ah_int, ah_frac);
-        snprintf(pressureBuf, sizeof(pressureBuf), "%d.%dmB", p_int, p_frac);
+        snprintf(pressureBuf, sizeof(pressureBuf), "%d.%02dmB", p_int, p_frac);
         snprintf(voltBuf, sizeof(voltBuf), "%d.%03dv", v_int, v_frac);
         snprintf(curBuf, sizeof(curBuf), "%lduA", (long)gBatteryCurrent_uA);
         
@@ -360,10 +363,11 @@ void drawMenu() {
     prepDisplay();
     u8g2.setFont(u8g2_font_profont17_tr);
     
-    for(int i = 0; i < NUM_MENU_ITEMS; i++) {
+    for(int i = 0; i < MENU_VISIBLE && menuScrollOffset + i < NUM_MENU_ITEMS; i++) {
+        int idx = menuScrollOffset + i;
         int y = 22 + i * 22;
-        u8g2.drawStr(40, y, menuItems[i]);
-        if(i == menuSelection) {
+        u8g2.drawStr(40, y, menuItems[idx]);
+        if(idx == menuSelection) {
             u8g2.drawFrame(30, y - 18, 220, 24);
         }
     }
@@ -405,7 +409,10 @@ float getHistValue(int chartIndex, int rawIdx) {
         case 0: return histTemp[idx] / 100.0f;
         case 1: return histRH[idx] / 100.0f;
         case 2: return histAbsHum[idx] / 100.0f;
-        case 3: return histPress[idx] / 10.0f;
+        case 3: {
+            uint16_t enc = histPress[idx];
+            return ((enc & 0x8000) ? 1000.0f : 900.0f) + (enc & 0x7FFF) / 100.0f;
+        }
         case 4: return histVolt[idx] / 1000.0f;
         case 5: return (float)histCur[idx];
         default: return 0.0f;
@@ -480,6 +487,10 @@ void drawChart(int chartIndex) {
             // 3 decimal places for Voltage
             int f = abs((int)(v * 1000.0f)) % 1000;
             snprintf(buf, sizeof(buf), "%s%d.%03d", sign, i, f);
+        } else if (chartIndex == 3) {
+            // 2 decimal places for Pressure
+            int f = abs((int)(v * 100.0f)) % 100;
+            snprintf(buf, sizeof(buf), "%s%d.%02d", sign, i, f);
         } else {
             // 1 decimal place for everything else
             int f = abs((int)(v * 10.0f)) % 10;
@@ -704,6 +715,23 @@ bool isPressed(uint32_t pin) {
 }
 
 void setup() {
+    pinMode(PIN_LCD_TE, INPUT_ANALOG);
+    pinMode(PIN_LCD_CS,  OUTPUT); digitalWrite(PIN_LCD_CS,  HIGH);
+    pinMode(PIN_LCD_DC,  OUTPUT); digitalWrite(PIN_LCD_DC,  HIGH);
+    pinMode(PIN_LCD_RST, OUTPUT); digitalWrite(PIN_LCD_RST, HIGH);
+
+    SPI.setSCLK(PIN_LCD_SCLK);
+    SPI.setMOSI(PIN_LCD_MOSI);
+    u8g2.begin();
+    u8g2.setBusClock(12000000);
+    u8g2.sendF("c", 0x39);
+    u8g2.sendF("ca", 0xB2, 0x00);
+    prepDisplay();
+    u8g2.setFont(u8g2_font_profont17_tr);
+    u8g2.drawStr(20, 80, "10 second window to flash...");
+    sendBufferDirect();
+
+    delay(10000);
 
     pinMode(PA10, INPUT_ANALOG); 
     pinMode(PA9,  INPUT_ANALOG);  
@@ -745,15 +773,6 @@ void setup() {
     lastSensorRead = bootEpoch;
     // ----------------------------------
 
-    pinMode(PIN_LCD_TE, INPUT_ANALOG);
-    pinMode(PIN_LCD_CS,  OUTPUT); digitalWrite(PIN_LCD_CS,  HIGH);
-    pinMode(PIN_LCD_DC,  OUTPUT); digitalWrite(PIN_LCD_DC,  HIGH);
-    pinMode(PIN_LCD_RST, OUTPUT); digitalWrite(PIN_LCD_RST, HIGH);
-
-    SPI.setSCLK(PIN_LCD_SCLK);
-    SPI.setMOSI(PIN_LCD_MOSI);
-    u8g2.begin();
-    u8g2.setBusClock(12000000);
 
     GPIO_InitTypeDef GPIO_InitStruct = {0};
     GPIO_InitStruct.Pin       = GPIO_PIN_5 | GPIO_PIN_7;
@@ -763,8 +782,7 @@ void setup() {
     GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    u8g2.sendF("c", 0x39);
-    u8g2.sendF("ca", 0xB2, 0x00);
+
     
     forceMainRedraw = true;
     paintMainScreen(stmRtc.getEpoch());
@@ -809,7 +827,12 @@ void loop() {
             histTemp[histHead]   = (int16_t)(gTemperature * 100.0f);
             histRH[histHead]     = (uint16_t)(gHumidity * 100.0f); 
             histAbsHum[histHead] = (uint16_t)(gAbsHumidity * 100.0f);
-            histPress[histHead]  = (uint16_t)(gPressure * 10.0f);
+            { // Encode: bit 15 = hundreds is 10, bits 0-14 = remainder*100
+                float p = gPressure;
+                int h = (int)(p / 100.0f);
+                uint16_t rem = (uint16_t)((p - h * 100.0f) * 100.0f + 0.5f);
+                histPress[histHead] = (h == 10 ? 0x8000 : 0) | (rem & 0x7FFF);
+            }
             histCur[histHead]    = (int16_t)gBatteryCurrent_uA;
 
             histHead = (histHead + 1) % MAX_SAMPLES;
@@ -886,6 +909,7 @@ bool currUp = isPressed(BTN_UP);
         if (pressRight) {
             currentState = STATE_MENU;
             menuSelection = 0;
+            menuScrollOffset = 0;
             lastInteractionTime = millis();
             drawMenu();
         }
@@ -896,9 +920,13 @@ bool currUp = isPressed(BTN_UP);
             
             if (pressUp) {
                 menuSelection = (menuSelection == 0) ? NUM_MENU_ITEMS - 1 : menuSelection - 1;
+                if (menuSelection < menuScrollOffset) menuScrollOffset = menuSelection;
+                if (menuSelection > menuScrollOffset + MENU_VISIBLE - 1) menuScrollOffset = menuSelection - MENU_VISIBLE + 1;
                 drawMenu();
             } else if (pressDown) {
                 menuSelection = (menuSelection == NUM_MENU_ITEMS - 1) ? 0 : menuSelection + 1;
+                if (menuSelection < menuScrollOffset) menuScrollOffset = menuSelection;
+                if (menuSelection > menuScrollOffset + MENU_VISIBLE - 1) menuScrollOffset = menuSelection - MENU_VISIBLE + 1;
                 drawMenu();
             } else if (pressLeft) {
                     goMain();
@@ -909,6 +937,19 @@ bool currUp = isPressed(BTN_UP);
                     tempHour = (now % 86400) / 3600;
                     tempMinute = (now % 3600) / 60;
                     drawSetTime();
+                } else if (menuSelection == 7) {
+                    memset(histTemp, 0, sizeof(histTemp));
+                    memset(histRH, 0, sizeof(histRH));
+                    memset(histAbsHum, 0, sizeof(histAbsHum));
+                    memset(histPress, 0, sizeof(histPress));
+                    memset(histVolt, 0, sizeof(histVolt));
+                    memset(histCur, 0, sizeof(histCur));
+                    histHead = 0; histCount = 0;
+                    voltHead = 0; voltCount = 0; voltSampleCounter = 0;
+                    bootEpoch = stmRtc.getEpoch();
+                    goMain();
+                } else if (menuSelection == 8) {
+                    NVIC_SystemReset();
                 } else {
                     currentState = STATE_CHART;
                     chartCursor = -1; 
